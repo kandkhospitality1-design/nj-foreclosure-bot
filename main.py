@@ -146,18 +146,23 @@ def scrape_page(session, page, date_added_val):
 
 def scrape():
     s = requests.Session()
-    # Login
+    # Login via WordPress
+    s.get('https://njlispendens.com/wp-login.php', timeout=30)  # get testcookie
     login_resp = s.post(
-        'https://www.njlispendens.com/member/property',
+        'https://njlispendens.com/wp-login.php',
         data={
-            'amember_login': NJ_USER,
-            'amember_pass': NJ_PASS,
-            'login_attempt_id': '1',
+            'log': NJ_USER,
+            'pwd': NJ_PASS,
+            'wp-submit': 'Log In',
+            'redirect_to': 'https://njlispendens.com/wp-admin/',
+            'testcookie': '1',
+            'rememberme': 'forever'
         },
         headers={'Content-Type': 'application/x-www-form-urlencoded'},
         allow_redirects=True,
         timeout=30
     )
+    print('Login status: ' + str(login_resp.status_code) + ' | URL: ' + login_resp.url)
 
     # Use date_added=30 (max available = within 30 days); we filter by LOOKBACK_DAYS in code
     date_val = '30' if LOOKBACK_DAYS > 7 else '7'
