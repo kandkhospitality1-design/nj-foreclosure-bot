@@ -24,6 +24,7 @@ RESIMPLI_HEADERS = {
     'Authorization': 'Bearer ' + RESIMPLI_TOKEN,
     'Content-Type': 'application/json'
 }
+RESIMPLI_BASE = 'https://live-api.resimpli.com/api/v4'
 
 
 def equity_score(ev, lb):
@@ -307,7 +308,7 @@ def skip_trace_resimpli(props):
                 'address': house, 'street': street,
                 'city': p['city'], 'state': 'NJ', 'zip': p['zip']
             }
-            r = requests.post('https://api.resimpli.com/skip-trace',
+            r = requests.post('https://live-api.resimpli.com/api/v4/skipTrace/singleSkipTrace',
                               json=payload, headers=RESIMPLI_HEADERS, timeout=30)
             if r.status_code in (200, 201):
                 d = r.json().get('data', {})
@@ -330,7 +331,7 @@ def skip_trace_resimpli(props):
                     p['absentee'] = pi.get('absenteeOwner', False)
                     p['vacant']   = pi.get('vacant', False)
             else:
-                print('Skip trace HTTP ' + str(r.status_code) + ' for ' + p['address'])
+                print('Skip trace HTTP ' + str(r.status_code) + ' for ' + p['address'] + ' | resp: ' + r.text[:200])
             time.sleep(0.5)
         except Exception as e:
             print('Skip trace error: ' + str(e))
@@ -365,7 +366,7 @@ def push_lead(p, score, label, drip_id):
                   'Year Built: '+str(p['yr'])+'\n'
                   'Absentee: '+str(p['absentee']))
     }
-    r = requests.post('https://api.resimpli.com/lead',
+    r = requests.post('https://live-api.resimpli.com/api/v4/lead/create',
                       json=payload, headers=RESIMPLI_HEADERS, timeout=30)
     if r.status_code not in (200,201):
         print('Lead failed: '+str(r.status_code)+' '+r.text[:200])
@@ -374,8 +375,8 @@ def push_lead(p, score, label, drip_id):
     if not lid: return False
     print('Created: '+p['address']+', '+p['city']+' | KPS:'+str(score)+' '+label)
     if drip_id:
-        dr = requests.post('https://api.resimpli.com/lead/'+lid+'/drip-campaign',
-                           json={'dripCampaignId':drip_id},
+        dr = requests.post('https://live-api.resimpli.com/api/v4/drip/assignDripToLead',
+                           json={'leadId':lid,'dripCampaignId':drip_id},
                            headers=RESIMPLI_HEADERS, timeout=30)
         print('  Drip: ' + ('OK' if dr.status_code in (200,201) else 'FAILED '+str(dr.status_code)))
     return True
