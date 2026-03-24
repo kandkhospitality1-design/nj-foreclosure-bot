@@ -8,12 +8,16 @@ from bs4 import BeautifulSoup
 NJ_USER        = os.environ['NJ_USERNAME']
 NJ_PASS        = os.environ['NJ_PASSWORD']
 RESIMPLI_TOKEN = os.environ['RESIMPLI_TOKEN']
-BST_API_KEY    = os.environ['BST_API_KEY']
 SEEN_FILE      = 'seen_properties.json'
 
 DRIP_HOT  = '69c2f816a121be22d81a6c85'
 DRIP_WARM = '69c2f97068818e6c3fa39cd5'
 DRIP_COLD = '69c30c665ea684747e339fa3'
+
+RESIMPLI_HEADERS = {
+    'Authorization': 'Bearer ' + RESIMPLI_TOKEN,
+    'Content-Type': 'application/json'
+}
 
 def equity_score(ev, lb):
     if not ev: return 0
@@ -92,9 +96,8 @@ def scrape():
             def days_since(ds):
                 try: return (datetime.now()-datetime.strptime(ds.strip(),'%m/%d/%Y')).days
                 except: return 999
-            lb = dol(5)
             props.append({'docket':txt(0),'address':txt(1),'city':txt(2),'zip':txt(3),
-                          'plaintiff':txt(4),'lb':lb,'file_date':txt(6),'owner':txt(7),
+                          'plaintiff':txt(4),'lb':dol(5),'file_date':txt(6),'owner':txt(7),
                           'ev':0,'phone':'','phone_found':False,'mail_found':False,
                           'mailing_address':'','mailing_city':'','mailing_state':'','mailing_zip':'',
                           'ptype':'','yr':None,'tax':False,'absentee':False,'vacant':False,'bk':False,
@@ -103,41 +106,54 @@ def scrape():
             print('parse error: ' + str(e))
     return props
 
-def skip_trace(props):
+def skip_trace_resimpli(props):
+    """Use REsimpli built-in skip tracing API"""
     if not props: return props
-    records = []
     for p in props:
-        parts = p['owner'].split()
-        ap = p['address'].split()
-        records.append({'firstName':parts[0] if parts else '','lastName':parts[-1] if len(parts)>1 else '',
-                        'address':ap[0] if ap else '','street':' '.join(ap[1:]),
-                        'city':p['city'],'state':'NJ','zip':p['zip']})
-    r = requests.post('https://api.batchskiptracing.com/api/property',
-                      json={'propertyList':records},
-                      headers={'Content-Type':'application/json','x-api-key':BST_API_KEY},
-                      timeout=60)
-    if r.status_code != 200:
-        print('BST error: ' + str(r.status_code))
-        return props
-    for i, res in enumerate(r.json().get('propertyList',[])):
-        if i >= len(props): break
-        p = props[i]
-        phones = res.get('phoneNumbers',[])
-        if phones: p['phone_found']=True; p['phone']=phones[0].get('phone','')
-        mail = res.get('mailingAddress',{})
-        if mail.get('address'):
-            p['mail_found']=True; p['mailing_address']=mail.get('address','')
-            p['mailing_city']=mail.get('city',''); p['mailing_state']=mail.get('state',''); p['mailing_zip']=mail.get('zip','')
-        pi = res.get('propertyInfo',{})
-        if pi:
-            p['ev']=pi.get('estimatedValue',0) or 0; p['ptype']=pi.get('propertyUse','')
-            p['yr']=pi.get('yearBuilt'); p['absentee']=pi.get('absenteeOwner',False); p['vacant']=pi.get('vacant',False)
-        ti = res.get('taxInfo',{})
-        if ti: p['tax']=ti.get('delinquent',False)
+        try:
+            parts = p['owner'].split()
+            first = parts[0] if parts else ''
+            last = parts[-1] if len(parts) > 1 else ''
+            ap = p['address'].split()
+            house = ap[0] if ap else ''
+            street = ' '.join(ap[1:]) if len(ap) > 1 else p['address']
+            payload = {
+                'firstName': first,
+                'lastName': last,
+                'address': house,
+                'street': street,
+                'city': p['city'],
+                'state': 'NJ',
+                'zip': p['zip']
+            }
+            r = requests.post('https://api.resimpli.com/skip-trace',
+                              json=payload, headers=RESIMPLI_HEADERS, timeout=30)
+            if r.status_code in (200, 201):
+                d = r.json().get('data', {})
+                phones = d.get('phones', [])
+                if phones:
+                    p['phone_found'] = True
+                    p['phone'] = phones[0].get('number', '')
+                mail = d.get('mailingAddress', {})
+                if mail.get('address'):
+                    p['mail_found'] = True
+                    p['mailing_address'] = mail.get('address', '')
+                    p['mailing_city'] = mail.get('city', '')
+                    p['mailing_state'] = mail.get('state', '')
+                    p['mailing_zip'] = mail.get('zip', '')
+                pi = d.get('propertyInfo', {})
+                if pi:
+                    p['ev'] = pi.get('estimatedValue', 0) or 0
+                    p['ptype'] = pi.get('propertyUse', '')
+                    p['yr'] = pi.get('yearBuilt')
+                    p['absentee'] = pi.get('absenteeOwner', False)
+                    p['vacant'] = pi.get('vacant', False)
+            time.sleep(0.5)
+        except Exception as e:
+            print('Skip trace error: ' + str(e))
     return props
 
 def push_lead(p, score, label, drip_id):
-    h = {'Authorization':'Bearer '+RESIMPLI_TOKEN,'Content-Type':'application/json'}
     parts = p['owner'].split()
     payload = {
         'firstName': parts[0] if parts else 'Unknown',
@@ -148,19 +164,19 @@ def push_lead(p, score, label, drip_id):
         'leadSource': 'NJ Pre-Foreclosure', 'tags': [label],
         'mailingAddress':p.get('mailing_address',''), 'mailingCity':p.get('mailing_city',''),
         'mailingState':p.get('mailing_state',''), 'mailingZip':p.get('mailing_zip',''),
-        'notes': 'KPS: '+str(score)+' - '+label+'\nDocket: '+p['docket']+'\nMortgage: '+str(p['lb'])+'\nEst Value: '+str(p['ev'])+'\nFiled: '+p['file_date']+'\nPlaintiff: '+p['plaintiff']+'\nYear Built: '+str(p['yr'])+'\nTax Delinquent: '+str(p['tax'])+'\nAbsentee: '+str(p['absentee'])
+        'notes': 'KPS: '+str(score)+' - '+label+'\nDocket: '+p['docket']+'\nMortgage: $'+str(int(p['lb']))+'\nEst Value: $'+str(int(p['ev']))+'\nFiled: '+p['file_date']+'\nPlaintiff: '+p['plaintiff']+'\nYear Built: '+str(p['yr'])+'\nTax Delinquent: '+str(p['tax'])+'\nAbsentee: '+str(p['absentee'])
     }
-    r = requests.post('https://api.resimpli.com/lead', json=payload, headers=h, timeout=30)
+    r = requests.post('https://api.resimpli.com/lead', json=payload, headers=RESIMPLI_HEADERS, timeout=30)
     if r.status_code not in (200,201):
-        print('Lead failed: '+str(r.status_code))
+        print('Lead failed: '+str(r.status_code)+' '+r.text[:200])
         return False
     lid = (r.json().get('data') or {}).get('_id') or r.json().get('_id')
     if not lid: return False
     print('Created: '+p['address']+' | KPS:'+str(score)+' '+label)
     if drip_id:
         dr = requests.post('https://api.resimpli.com/lead/'+lid+'/drip-campaign',
-                           json={'dripCampaignId':drip_id}, headers=h, timeout=30)
-        print('  Drip: OK' if dr.status_code in (200,201) else '  Drip: FAILED')
+                           json={'dripCampaignId':drip_id}, headers=RESIMPLI_HEADERS, timeout=30)
+        print('  Drip: ' + ('OK' if dr.status_code in (200,201) else 'FAILED '+str(dr.status_code)))
     return True
 
 def main():
@@ -170,16 +186,20 @@ def main():
     new_props = [p for p in props if p['docket'] not in seen]
     print('Scraped '+str(len(props))+', '+str(len(new_props))+' new')
     if not new_props: return
-    new_props = skip_trace(new_props)
-    time.sleep(2)
+    print('Skip tracing...')
+    new_props = skip_trace_resimpli(new_props)
     pushed = 0
     for p in new_props:
         score, label = calculate_kps(p)
+        if label == 'SKIP':
+            print('Skipping '+p['address']+' (KPS '+str(score)+')')
+            seen.add(p['docket'])
+            continue
         if push_lead(p, score, label, get_drip_id(score)):
             seen.add(p['docket']); pushed += 1
         time.sleep(0.5)
     save_seen(seen)
-    print('Done: '+str(pushed)+'/'+str(len(new_props))+' imported')
+    print('Done: '+str(pushed)+' leads imported')
 
 if __name__ == '__main__':
     main()
