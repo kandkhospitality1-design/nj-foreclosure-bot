@@ -146,23 +146,27 @@ def scrape_page(session, page, date_added_val):
 
 def scrape():
     s = requests.Session()
-    # Login via WordPress
-    s.get('https://njlispendens.com/wp-login.php', timeout=30)  # get testcookie
+    # Login via aMember - must GET login page first to extract dynamic login_attempt_id
+    login_page = s.get('https://www.njlispendens.com/member/property', timeout=30)
+    soup_login = BeautifulSoup(login_page.text, 'html.parser')
+    attempt_input = soup_login.find('input', {'name': 'login_attempt_id'})
+    login_attempt_id = attempt_input['value'] if attempt_input else '1'
     login_resp = s.post(
-        'https://njlispendens.com/wp-login.php',
+        'https://www.njlispendens.com/member/login',
         data={
-            'log': NJ_USER,
-            'pwd': NJ_PASS,
-            'wp-submit': 'Log In',
-            'redirect_to': 'https://njlispendens.com/wp-admin/',
-            'testcookie': '1',
-            'rememberme': 'forever'
+            'amember_login': NJ_USER,
+            'amember_pass': NJ_PASS,
+            'login_attempt_id': login_attempt_id,
+            'amember_redirect_url': '/member/property'
         },
         headers={'Content-Type': 'application/x-www-form-urlencoded'},
         allow_redirects=True,
         timeout=30
     )
     print('Login status: ' + str(login_resp.status_code) + ' | URL: ' + login_resp.url)
+    # Verify we're logged in by checking for logout link
+    if 'Logout' not in login_resp.text and 'kfreedman' not in login_resp.text.lower():
+        print('WARNING: Login may have failed - no logout link found')
 
     # Use date_added=30 (max available = within 30 days); we filter by LOOKBACK_DAYS in code
     date_val = '30' if LOOKBACK_DAYS > 7 else '7'
