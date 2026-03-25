@@ -40,50 +40,36 @@ def equity_score(ev, lb):
 
 def distress_score(days, tax=False, absentee=False, vacant=False):
     pts = 10 if days <= 7 else 7 if days <= 30 else 4 if days <= 90 else 0
-    if tax: pts += 8
+    if tax:      pts += 8
     if absentee: pts += 5
-    if vacant: pts += 2
+    if vacant:   pts += 2
     return min(pts, 25)
 
 
 def market_score(city):
-    city = city.lower()
-    tier1 = {'newark', 'paterson', 'elizabeth'}
-    tier2 = {'irvington', 'east orange', 'belleville'}
-    if city in tier1: return 20
-    if city in tier2: return 15
+    hot   = {'newark', 'paterson', 'elizabeth'}
+    warm  = {'irvington', 'east orange', 'belleville'}
+    c = city.lower().strip()
+    if c in hot:   return 20
+    if c in warm:  return 15
     return 10
 
 
-def deal_score(prop):
+def deal_score(has_phone=False, prop_type='SFR', year_built=None, no_bankruptcy=True):
     pts = 0
-    if prop.get('phone'): pts += 5
-    pt = prop.get('property_type', '')
-    if 'sfr' in pt.lower() or 'single' in pt.lower(): pts += 5
-    elif '2' in pt or '3' in pt or '4' in pt: pts += 4
-    yr = prop.get('year_built', 0)
-    if yr and yr < 1980: pts += 3
-    if not prop.get('bankruptcy'): pts += 3
+    if has_phone:      pts += 5
+    if prop_type == 'SFR':        pts += 5
+    elif prop_type in ('2-4','duplex','triplex'): pts += 4
+    if year_built and year_built < 1980: pts += 3
+    if no_bankruptcy:  pts += 3
     return min(pts, 20)
 
 
-def kps(prop):
-    ev = prop.get('estimated_value', 0) or 0
-    lb = prop.get('loan_balance', 0) or 0
-    days = prop.get('days_since_filing', 999)
-    eq = equity_score(ev, lb)
-    di = distress_score(days, prop.get('tax_delinquent', False),
-                        prop.get('absentee', False), prop.get('vacant', False))
-    mk = market_score(prop.get('city', ''))
-    dl = deal_score(prop)
-    return eq + di + mk + dl
-
-
-def assign_drip(score):
-    if score >= 80: return DRIP_HOT
-    if score >= 65: return DRIP_WARM
-    if score >= 45: return DRIP_COLD
-    return None
+def kps_score(ev, lb, days, city, **kwargs):
+    return (equity_score(ev, lb) +
+            distress_score(days, **kwargs) +
+            market_score(city) +
+            deal_score())
 
 
 def load_seen():
@@ -98,207 +84,236 @@ def save_seen(seen):
         json.dump(list(seen), f)
 
 
-def parse_card_text(text):
-    date_m  = re.search(r'File Date[:\s]+([\d\-/]+)', text)
-    docket_m = re.search(r'Docket No[:\s]+(\S+)', text)
-    county_m = re.search(r'County[:\s]+([^\n\t]+)', text)
-    city_m  = re.search(r'([A-Za-z][A-Za-z\s]+)\s+NJ\s+\d{5}', text)
-    zip_m   = re.search(r'NJ\s+(\d{5})', text)
-    mort_m  = re.search(r'Orig Mortgage[:\s]+([\d,]+)', text)
-    date_str  = date_m.group(1).strip()  if date_m  else ''
-    docket    = docket_m.group(1).strip() if docket_m else ''
-    county    = county_m.group(1).strip() if county_m else ''
-    city      = city_m.group(1).strip()  if city_m  else ''
-    zip_code  = zip_m.group(1).strip()   if zip_m   else ''
-    loan_balance = 0
-    if mort_m:
-        try:
-            loan_balance = int(mort_m.group(1).replace(',', ''))
-        except Exception:
-            pass
-    try:
-        if '-' in date_str:
-            filed_date = datetime.strptime(date_str, '%Y-%m-%d')
-        else:
-            filed_date = datetime.strptime(date_str, '%m/%d/%Y')
-    except Exception:
-        filed_date = datetime.now()
-    days_since = (datetime.now() - filed_date).days
-    return {
-        'docket': docket,
-        'address': city + ' NJ ' + zip_code,
-        'city': city,
-        'zip': zip_code,
-        'county': county,
-        'date_filed': date_str,
-        'days_since_filing': days_since,
-        'filed_date': filed_date,
-        'estimated_value': 0,
-        'loan_balance': loan_balance,
-        'phone': None,
-        'property_type': 'SFR',
-        'year_built': 0,
-        'bankruptcy': False,
-        'tax_delinquent': False,
-        'absentee': False,
-        'vacant': False
-    }
-
-
-def scrape_with_playwright():
-    props = []
-    cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS)
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        ctx = browser.new_context()
-        page = ctx.new_page()
-        print('Navigating to login page...')
-        page.goto('https://www.njlispendens.com/member/login', wait_until='networkidle')
-        page.fill('input[name="amember_login"]', NJ_USER)
-        page.fill('input[name="amember_pass"]', NJ_PASS)
-        page.click('input[type="submit"], button[type="submit"]')
-        page.wait_for_load_state('networkidle')
-        if 'logout' in page.content().lower() or 'property' in page.title().lower():
-            print('Logged in to NJLisPendens')
-        else:
-            print(f'WARNING: login uncertain. Title: {page.title()} URL: {page.url}')
-        page_num = 0
-        while True:
-            url = f'https://www.njlispendens.com/member/property?per_page=50&cp={page_num}'
-            page.goto(url, wait_until='networkidle')
-            content = page.content()
-            cards = page.query_selector_all('.pop-row')
-            if not cards:
-                print(f'No cards on page {page_num} - stopping')
-                break
-            found_any = False
-            for card in cards:
-                try:
-                    text = card.inner_text()
-                    prop = parse_card_text(text)
-                    if prop['county'] not in TARGET_COUNTIES:
-                        continue
-                    if prop['filed_date'] < cutoff:
-                        continue
-                    found_any = True
-                    props.append(prop)
-                    print(f'  Found: {prop["docket"]} {prop["city"]} ({prop["county"]}) {prop["date_filed"]}')
-                except Exception as e:
-                    print(f'Card parse error: {e}')
-            if not found_any:
-                print(f'No matching cards on page {page_num} - stopping')
-                break
-            page_num += 1
-            time.sleep(1)
-        browser.close()
-    return props
-
-
 def create_lead(prop):
     payload = {
-        'firstName': '',
-        'lastName': '',
-        'propertyAddress': prop.get('address', ''),
-        'propertyCity': prop.get('city', ''),
-        'propertyState': 'NJ',
-        'propertyZip': prop.get('zip', ''),
-        'county': prop.get('county', ''),
-        'leadSource': 'NJLisPendens',
-        'notes': f"Filed: {prop.get('date_filed','')} | Docket: {prop.get('docket','')}"
+        'firstName': 'NJ Foreclosure',
+        'lastName':  prop.get('docket', 'Unknown'),
+        'address':   prop.get('city', ''),
+        'state':     'NJ',
+        'zip':       prop.get('zip', ''),
+        'leadSource':'NJLisPendens',
+        'notes':     f"County: {prop.get('county')} | Docket: {prop.get('docket')} | Filed: {prop.get('date')} | Mortgage: {prop.get('mortgage')} | Score: {prop.get('score')}"
     }
     r = requests.post(f'{RESIMPLI_BASE}/lead/save',
                       headers=RESIMPLI_HEADERS, json=payload)
     if r.status_code == 200:
-        data = r.json()
-        lead_id = data.get('data', {}).get('_id') or data.get('_id')
-        print(f'Created lead {lead_id} for {prop.get("address")}')
-        return lead_id
-    else:
-        print(f'Lead create failed {r.status_code}: {r.text[:200]}')
-        return None
+        return r.json().get('data', {}).get('_id') or r.json().get('_id')
+    print(f'Lead create failed: {r.status_code} {r.text[:200]}')
+    return None
 
 
-def skip_trace(lead_id, prop):
-    payload = {
-        'leadId': lead_id,
-        'address': prop.get('address', ''),
-        'city': prop.get('city', ''),
-        'state': 'NJ',
-        'zip': prop.get('zip', '')
-    }
+def skip_trace(lead_id):
     r = requests.post(f'{RESIMPLI_BASE}/lead/leadSkipTrace',
-                      headers=RESIMPLI_HEADERS, json=payload)
-    print(f'Skip trace {r.status_code} for lead {lead_id}')
+                      headers=RESIMPLI_HEADERS,
+                      json={'leadId': lead_id})
+    if r.status_code != 200:
+        print(f'Skip trace failed: {r.status_code} {r.text[:200]}')
 
 
-def enroll_drip(lead_id, drip_id):
-    payload = {
-        'leadId': lead_id,
-        'masterDripId': drip_id
-    }
+def enroll_drip(lead_id, score):
+    if score >= 80:   drip_id = DRIP_HOT
+    elif score >= 65: drip_id = DRIP_WARM
+    elif score >= 45: drip_id = DRIP_COLD
+    else: return
     r = requests.post(f'{RESIMPLI_BASE}/masterDrip/assignToLead',
-                      headers=RESIMPLI_HEADERS, json=payload)
-    print(f'Drip enroll {r.status_code} for lead {lead_id} drip {drip_id}')
+                      headers=RESIMPLI_HEADERS,
+                      json={'leadId': lead_id, 'masterDripId': drip_id})
+    if r.status_code != 200:
+        print(f'Drip enroll failed: {r.status_code} {r.text[:200]}')
 
 
-def process_prop(prop, seen):
-    docket = prop.get('docket', '')
-    if docket and docket in seen:
-        return False
-    score = kps(prop)
-    print(f'KPS={score} for {prop.get("address")} ({prop.get("county")})')
-    if score < 25:
-        print(f'  Score too low, skipping')
-        if docket:
-            seen.add(docket)
-        return False
-    if TEST_MODE:
-        print(f'  TEST_MODE: would create lead + skip trace + drip (score={score})')
-        if docket:
-            seen.add(docket)
-        return True
-    lead_id = create_lead(prop)
-    if not lead_id:
-        return False
-    skip_trace(lead_id, prop)
-    drip_id = assign_drip(score)
-    if drip_id:
-        enroll_drip(lead_id, drip_id)
-    if docket:
-        seen.add(docket)
-    return True
+def scrape_with_playwright():
+    properties = []
+    cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+            ]
+        )
+        ctx = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        page = ctx.new_page()
+
+        print('Navigating to login page...')
+        page.goto('https://www.njlispendens.com/member/login', wait_until='domcontentloaded')
+        page.wait_for_timeout(2000)
+
+        # Fill login form
+        page.fill('input[name="amember_login"]', NJ_USER)
+        page.wait_for_timeout(500)
+        page.fill('input[name="amember_pass"]', NJ_PASS)
+        page.wait_for_timeout(500)
+
+        # Submit by pressing Enter (more reliable than clicking submit)
+        page.press('input[name="amember_pass"]', 'Enter')
+        page.wait_for_load_state('domcontentloaded')
+        page.wait_for_timeout(3000)
+
+        page_content = page.content().lower()
+        page_url = page.url
+        print(f'After login - URL: {page_url} | Has logout: {"logout" in page_content}')
+
+        if 'logout' not in page_content and 'member/login' in page_url:
+            # Try clicking submit button as fallback
+            try:
+                page.click('input[type="submit"]')
+                page.wait_for_load_state('domcontentloaded')
+                page.wait_for_timeout(3000)
+                page_content = page.content().lower()
+                page_url = page.url
+                print(f'After fallback click - URL: {page_url}')
+            except Exception as e:
+                print(f'Fallback click failed: {e}')
+
+        if 'logout' not in page_content:
+            print(f'WARNING: login failed. URL: {page_url}')
+            browser.close()
+            return properties
+
+        print('Logged in to NJLisPendens successfully')
+
+        page_num = 0
+        while True:
+            url = f'https://www.njlispendens.com/member/property?per_page=50&cp={page_num}'
+            page.goto(url, wait_until='domcontentloaded')
+            page.wait_for_timeout(2000)
+
+            cards = page.query_selector_all('.pop-row')
+            print(f'Page {page_num}: found {len(cards)} cards')
+            if not cards:
+                print(f'No cards on page {page_num} - stopping')
+                break
+
+            stop_early = False
+            for card in cards:
+                try:
+                    text = card.inner_text()
+
+                    # Extract county
+                    county_m = re.search(r'County:\s*([A-Za-z]+)', text)
+                    county = county_m.group(1).strip() if county_m else ''
+
+                    if county not in TARGET_COUNTIES:
+                        continue
+
+                    # Extract file date
+                    date_m = re.search(r'File Date:\s*(\d{1,2}/\d{1,2}/\d{4})', text)
+                    if not date_m:
+                        continue
+                    file_date = datetime.strptime(date_m.group(1), '%m/%d/%Y')
+                    if file_date < cutoff:
+                        stop_early = True
+                        continue
+
+                    days_old = (datetime.now() - file_date).days
+
+                    # Extract docket
+                    docket_m = re.search(r'Docket(?:\s*No\.?)?:\s*([A-Z0-9\-]+)', text, re.I)
+                    docket = docket_m.group(1).strip() if docket_m else ''
+
+                    # Extract city from NJ zip pattern context
+                    city_m = re.search(r'([A-Za-z\s]+),\s*NJ\s*(\d{5})', text)
+                    city = city_m.group(1).strip() if city_m else ''
+                    zip_code = city_m.group(2) if city_m else ''
+
+                    # Extract mortgage amount
+                    mort_m = re.search(r'Orig(?:inal)?\s+Mortgage:\s*\$?([\d,\.]+)', text, re.I)
+                    mortgage = mort_m.group(1).replace(',','') if mort_m else '0'
+
+                    score = kps_score(0, float(mortgage) if mortgage else 0, days_old, city)
+
+                    properties.append({
+                        'county':   county,
+                        'date':     date_m.group(1),
+                        'docket':   docket,
+                        'city':     city,
+                        'zip':      zip_code,
+                        'mortgage': mortgage,
+                        'score':    score,
+                        'days_old': days_old,
+                    })
+                    print(f'Found: {docket} | {city} ({county}) | Score: {score}')
+
+                except Exception as e:
+                    print(f'Card parse error: {e}')
+
+            if stop_early:
+                print('Reached properties older than cutoff - stopping pagination')
+                break
+
+            page_num += 1
+
+        browser.close()
+    return properties
 
 
-def run():
-    now = datetime.now().strftime('%Y-%m-%d %H:%M')
-    print(f'NJ Foreclosure Bot - {now} | TEST_MODE={TEST_MODE} | LOOKBACK_DAYS={LOOKBACK_DAYS}')
+def main():
+    print(f'NJ Foreclosure Bot - {datetime.now()} | TEST_MODE={TEST_MODE} | LOOKBACK_DAYS={LOOKBACK_DAYS}')
+
     if TEST_MODE:
         print('TEST MODE: clearing seen_properties cache for fresh run')
         seen = set()
     else:
         seen = load_seen()
     print(f'Loaded {len(seen)} seen dockets')
+
     props = scrape_with_playwright()
     print(f'Scraped {len(props)} properties in target counties')
-    if not props:
+
+    new_props = [p for p in props if p['docket'] not in seen]
+    print(f'New properties to process: {len(new_props)}')
+
+    if not new_props:
         print('Nothing to process.')
+    else:
+        for prop in new_props:
+            score = prop['score']
+            docket = prop['docket']
+            print(f'Processing {docket} | Score: {score} | {prop["city"]} ({prop["county"]})')
+
+            if score < 25:
+                print(f'  SKIP (score {score} < 25)')
+                seen.add(docket)
+                continue
+
+            if TEST_MODE:
+                print(f'  TEST MODE: would create lead, skip trace, enroll drip')
+                print(f'  Score breakdown: {prop}')
+                seen.add(docket)
+                continue
+
+            lead_id = create_lead(prop)
+            if not lead_id:
+                print(f'  Failed to create lead for {docket}')
+                continue
+
+            skip_trace(lead_id)
+            enroll_drip(lead_id, score)
+            seen.add(docket)
+            print(f'  Done - lead {lead_id} created, skip traced, drip enrolled')
+
+        if not TEST_MODE:
+            save_seen(seen)
+
+    if TEST_MODE:
+        print('TEST_MODE: exiting after one run')
         return
-    new_count = 0
-    for prop in props:
-        try:
-            if process_prop(prop, seen):
-                new_count += 1
-        except Exception as e:
-            print(f'Error processing {prop.get("address")}: {e}')
-    save_seen(seen)
-    print(f'Done. Processed {new_count} new leads.')
+
+    print('Sleeping 24 hours...')
+    time.sleep(86400)
 
 
 if __name__ == '__main__':
     while True:
-        run()
-        if TEST_MODE:
-            print('TEST_MODE: exiting after one run')
-            break
-        print('Sleeping 24h...')
-        time.sleep(86400)
+        try:
+            main()
+        except Exception as e:
+            print(f'Error in main loop: {e}')
+            time.sleep(300)
