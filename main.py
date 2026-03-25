@@ -26,15 +26,15 @@ RESIMPLI_HEADERS = {
 RESIMPLI_BASE = 'https://live-api.resimpli.com/api/v4'
 
 def equity_score(ev, lb):
-        if not ev:
-                    return 0
-                p = (ev - lb) / ev * 100
+    if not ev:
+        return 0
+    p = (ev - lb) / ev * 100
     if p >= 50: return 35
-            if p >= 40: return 30
-                    if p >= 30: return 22
-                            if p >= 20: return 14
-                                    if p >= 10: return 7
-                                            return 0
+    if p >= 40: return 30
+    if p >= 30: return 22
+    if p >= 20: return 14
+    if p >= 10: return 7
+    return 0
 
 def distress_score(days, tax=False, absentee=False, vacant=False):
         pts = 10 if days <= 7 else 7 if days <= 30 else 4 if days <= 90 else 0
