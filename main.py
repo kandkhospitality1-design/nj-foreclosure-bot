@@ -6,11 +6,11 @@ import requests
 from datetime import datetime, timedelta
 from playwright.sync_api import sync_playwright
 
-NJ_USER        = os.environ['NJ_USERNAME']
-NJ_PASS        = os.environ['NJ_PASSWORD']
+NJ_USER    = os.environ['NJ_USERNAME']
+NJ_PASS    = os.environ['NJ_PASSWORD']
 RESIMPLI_TOKEN = os.environ['RESIMPLI_TOKEN']
-SEEN_FILE      = 'seen_properties.json'
-TEST_MODE      = os.environ.get('TEST_MODE', 'false').lower() == 'true'
+SEEN_FILE    = 'seen_properties.json'
+TEST_MODE    = os.environ.get('TEST_MODE', 'false').lower() == 'true'
 LOOKBACK_DAYS  = int(os.environ.get('LOOKBACK_DAYS', '15'))
 
 DRIP_HOT  = '69c2f816a121be22d81a6c85'
@@ -77,10 +77,10 @@ def save_seen(seen):
 def create_lead(prop):
     payload = {
         'firstName': 'NJ Foreclosure',
-        'lastName': prop.get('docket', 'Unknown'),
-        'address': prop.get('city', ''),
-        'state': 'NJ',
-        'zip': prop.get('zip', ''),
+        'lastName':  prop.get('docket', 'Unknown'),
+        'address':   prop.get('city', ''),
+        'state':     'NJ',
+        'zip':       prop.get('zip', ''),
         'leadSource': 'NJLisPendens',
         'notes': (
             f"County: {prop.get('county')} | Docket: {prop.get('docket')} | "
@@ -88,7 +88,8 @@ def create_lead(prop):
             f"Score: {prop.get('score')}"
         )
     }
-    r = requests.post(f'{RESIMPLI_BASE}/lead/save', headers=RESIMPLI_HEADERS, json=payload)
+    r = requests.post(f'{RESIMPLI_BASE}/lead/save',
+                      headers=RESIMPLI_HEADERS, json=payload)
     if r.status_code == 200:
         return r.json().get('data', {}).get('_id') or r.json().get('_id')
     print(f'Lead create failed: {r.status_code} {r.text[:200]}')
@@ -97,21 +98,16 @@ def create_lead(prop):
 def skip_trace(lead_id):
     r = requests.post(
         f'{RESIMPLI_BASE}/lead/leadSkipTrace',
-        headers=RESIMPLI_HEADERS,
-        json={'leadId': lead_id}
+        headers=RESIMPLI_HEADERS, json={'leadId': lead_id}
     )
     if r.status_code != 200:
         print(f'Skip trace failed: {r.status_code} {r.text[:200]}')
 
 def enroll_drip(lead_id, score):
-    if score >= 80:
-        drip_id = DRIP_HOT
-    elif score >= 65:
-        drip_id = DRIP_WARM
-    elif score >= 45:
-        drip_id = DRIP_COLD
-    else:
-        return
+    if score >= 80:   drip_id = DRIP_HOT
+    elif score >= 65: drip_id = DRIP_WARM
+    elif score >= 45: drip_id = DRIP_COLD
+    else: return
     r = requests.post(
         f'{RESIMPLI_BASE}/masterDrip/assignToLead',
         headers=RESIMPLI_HEADERS,
@@ -123,8 +119,15 @@ def enroll_drip(lead_id, score):
 def do_login(page):
     """Attempt login, return True on success."""
     print('Navigating to login page...')
-    page.goto('https://www.njlispendens.com/member/login', wait_until='domcontentloaded')
-    page.wait_for_timeout(2000)
+    page.goto('https://www.njlispendens.com/member/login',
+              wait_until='domcontentloaded')
+    page.wait_for_timeout(3000)
+
+    # Check if site is having server errors
+    body_text = page.inner_text('body')
+    if 'An Error has occurred' in body_text or 'internal error' in body_text.lower():
+        print('Server error detected on login page')
+        return False
 
     # Fill credentials
     page.fill('input[name="amember_login"]', NJ_USER)
@@ -132,7 +135,7 @@ def do_login(page):
     page.fill('input[name="amember_pass"]', NJ_PASS)
     page.wait_for_timeout(500)
 
-    # Submit
+    # Submit via Enter key
     page.press('input[name="amember_pass"]', 'Enter')
     try:
         page.wait_for_url(
@@ -144,7 +147,6 @@ def do_login(page):
     page.wait_for_timeout(3000)
 
     current_url = page.url
-    page_text = page.content().lower()
     print(f'After login attempt - URL: {current_url}')
 
     # Success: redirected away from login page
@@ -179,8 +181,11 @@ def do_login(page):
         return True
 
     print(f'WARNING: login failed. Final URL: {page.url}')
-    # Print first 500 chars of body for debugging
-    print(f'Page snippet: {page.inner_text("body")[:500]}')
+    # Print first 300 chars of body for debugging
+    try:
+        print(f'Page snippet: {page.inner_text("body")[:300]}')
+    except Exception:
+        pass
     return False
 
 def scrape_with_playwright():
@@ -206,7 +211,20 @@ def scrape_with_playwright():
         )
         page = ctx.new_page()
 
-        if not do_login(page):
+        # Retry login up to 3 times with waits between attempts
+        logged_in = False
+        for attempt in range(1, 4):
+            print(f'Login attempt {attempt} of 3...')
+            if do_login(page):
+                logged_in = True
+                break
+            if attempt < 3:
+                wait_secs = 15 * attempt
+                print(f'Login failed, waiting {wait_secs}s before retry...')
+                page.wait_for_timeout(wait_secs * 1000)
+
+        if not logged_in:
+            print('All login attempts failed - aborting')
             browser.close()
             return properties
 
@@ -250,7 +268,8 @@ def scrape_with_playwright():
                         continue
 
                     # Extract file date
-                    date_m = re.search(r'File Date:\s*(\d{1,2}/\d{1,2}/\d{4})', text)
+                    date_m = re.search(
+                        r'File Date:\s*(\d{1,2}/\d{1,2}/\d{4})', text)
                     if not date_m:
                         date_m = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', text)
                     if not date_m:
@@ -262,19 +281,24 @@ def scrape_with_playwright():
                     days_old = (datetime.now() - file_date).days
 
                     # Extract docket
-                    docket_m = re.search(r'Docket(?:\s*No\.?)?:\s*([A-Z0-9\-]+)', text, re.I)
+                    docket_m = re.search(
+                        r'Docket(?:\s*No\.?)?:\s*([A-Z0-9\-]+)', text, re.I)
                     docket = docket_m.group(1).strip() if docket_m else ''
 
                     # Extract city + zip
-                    city_m = re.search(r'([A-Za-z\s]+),\s*NJ\s*(\d{5})', text)
+                    city_m = re.search(
+                        r'([A-Za-z\s]+),\s*NJ\s*(\d{5})', text)
                     city = city_m.group(1).strip() if city_m else ''
                     zip_code = city_m.group(2) if city_m else ''
 
                     # Extract mortgage amount
-                    mort_m = re.search(r'Orig(?:inal)?\s+Mortgage:\s*\$?([\d,\.]+)', text, re.I)
+                    mort_m = re.search(
+                        r'Orig(?:inal)?\s+Mortgage:\s*\$?([\d,\.]+)',
+                        text, re.I)
                     mortgage = mort_m.group(1).replace(',', '') if mort_m else '0'
 
-                    score = kps_score(0, float(mortgage) if mortgage else 0, days_old, city)
+                    score = kps_score(
+                        0, float(mortgage) if mortgage else 0, days_old, city)
 
                     properties.append({
                         'county': county,
@@ -286,13 +310,16 @@ def scrape_with_playwright():
                         'score': score,
                         'days_old': days_old,
                     })
-                    print(f'  Found: {docket} | {city} ({county}) | Score: {score} | Filed: {date_m.group(1)}')
+                    print(f'  Found: {docket} | {city} ({county}) '
+                          f'| Score: {score} | Filed: {date_m.group(1)}')
+
                 except Exception as e:
                     print(f'  Card parse error: {e}')
 
             if stop_early:
                 print('Reached properties older than cutoff - stopping pagination')
                 break
+
             page_num += 1
 
         browser.close()
@@ -337,7 +364,6 @@ def main():
             if not lead_id:
                 print(f'  Failed to create lead for {docket}')
                 continue
-
             skip_trace(lead_id)
             enroll_drip(lead_id, score)
             seen.add(docket)
@@ -352,6 +378,7 @@ def main():
 
     print('Sleeping 24 hours...')
     time.sleep(86400)
+
 
 if __name__ == '__main__':
     if TEST_MODE:
