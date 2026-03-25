@@ -353,9 +353,17 @@ def main():
     time.sleep(86400)
 
 if __name__ == '__main__':
-    while True:
+    if TEST_MODE:
         try:
             main()
         except Exception as e:
-            print(f'Error in main loop: {e}')
-            time.sleep(300)
+            print(f'Error in test run: {e}')
+        import sys
+        sys.exit(0)
+    else:
+        while True:
+            try:
+                main()
+            except Exception as e:
+                print(f'Error in main loop: {e}')
+                time.sleep(300)
