@@ -233,7 +233,7 @@ def scrape_essex(page, from_date_str, to_date_str):
         page.fill('#ctl00_ContentPlaceHolder1_txtToTab2',   to_date_str)
 
         # Hit search
-        page.click('input[value="Search"]')
+        page.click('#ctl00_ContentPlaceHolder1_btnSearchTab2')
         page.wait_for_timeout(3000)
 
         # Check for results
