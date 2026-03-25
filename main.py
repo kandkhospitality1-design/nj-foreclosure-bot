@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import requests
@@ -121,6 +122,54 @@ def nj_login():
     return session
 
 
+def parse_card(card):
+    text = card.get_text(separator=' ', strip=True)
+    date_m = re.search(r'File Date[:\s]+([\d\-/]+)', text)
+    docket_m = re.search(r'Docket No[:\s]+(\S+)', text)
+    county_m = re.search(r'County[:\s]+([^\n\t]+)', text)
+    city_m = re.search(r'([A-Za-z][A-Za-z\s]+)\s+NJ\s+\d{5}', text)
+    zip_m = re.search(r'NJ\s+(\d{5})', text)
+    mort_m = re.search(r'Orig Mortgage[:\s]+([\d,]+)', text)
+    date_str = date_m.group(1).strip() if date_m else ''
+    docket = docket_m.group(1).strip() if docket_m else ''
+    county = county_m.group(1).strip() if county_m else ''
+    city = city_m.group(1).strip() if city_m else ''
+    zip_code = zip_m.group(1).strip() if zip_m else ''
+    loan_balance = 0
+    if mort_m:
+        try:
+            loan_balance = int(mort_m.group(1).replace(',', ''))
+        except Exception:
+            pass
+    try:
+        if '-' in date_str:
+            filed_date = datetime.strptime(date_str, '%Y-%m-%d')
+        else:
+            filed_date = datetime.strptime(date_str, '%m/%d/%Y')
+    except Exception:
+        filed_date = datetime.now()
+    days_since = (datetime.now() - filed_date).days
+    return {
+        'docket': docket,
+        'address': city + ' NJ ' + zip_code,
+        'city': city,
+        'zip': zip_code,
+        'county': county,
+        'date_filed': date_str,
+        'days_since_filing': days_since,
+        'filed_date': filed_date,
+        'estimated_value': 0,
+        'loan_balance': loan_balance,
+        'phone': None,
+        'property_type': 'SFR',
+        'year_built': 0,
+        'bankruptcy': False,
+        'tax_delinquent': False,
+        'absentee': False,
+        'vacant': False
+    }
+
+
 def scrape_properties(session):
     props = []
     cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS)
@@ -136,48 +185,20 @@ def scrape_properties(session):
         found_any = False
         for card in cards:
             try:
-                county_el = card.select_one('.county')
-                county = county_el.text.strip() if county_el else ''
+                prop = parse_card(card)
+                county = prop.get('county', '')
+                filed_date = prop.get('filed_date', datetime.min)
                 if county not in TARGET_COUNTIES:
                     continue
-                date_el = card.select_one('.date-filed')
-                date_str = date_el.text.strip() if date_el else ''
-                try:
-                    filed_date = datetime.strptime(date_str, '%m/%d/%Y')
-                except Exception:
-                    filed_date = datetime.now()
                 if filed_date < cutoff:
                     continue
                 found_any = True
-                address_el = card.select_one('.address')
-                address = address_el.text.strip() if address_el else ''
-                city_el = card.select_one('.city')
-                city = city_el.text.strip() if city_el else ''
-                docket_el = card.select_one('.docket')
-                docket = docket_el.text.strip() if docket_el else ''
-                days_since = (datetime.now() - filed_date).days
-                prop = {
-                    'docket': docket,
-                    'address': address,
-                    'city': city,
-                    'county': county,
-                    'date_filed': date_str,
-                    'days_since_filing': days_since,
-                    'estimated_value': 0,
-                    'loan_balance': 0,
-                    'phone': None,
-                    'property_type': 'SFR',
-                    'year_built': 0,
-                    'bankruptcy': False,
-                    'tax_delinquent': False,
-                    'absentee': False,
-                    'vacant': False
-                }
                 props.append(prop)
+                print(f'  Found: {prop["docket"]} {prop["city"]} ({prop["county"]}) {prop["date_filed"]}')
             except Exception as e:
                 print(f'Error parsing card: {e}')
         if not found_any:
-            print(f'No recent cards on page {page} - stopping')
+            print(f'No matching cards on page {page} - stopping')
             break
         page += 1
         time.sleep(1)
@@ -191,7 +212,7 @@ def create_lead(prop):
         'propertyAddress': prop.get('address', ''),
         'propertyCity': prop.get('city', ''),
         'propertyState': 'NJ',
-        'propertyZip': '',
+        'propertyZip': prop.get('zip', ''),
         'county': prop.get('county', ''),
         'leadSource': 'NJLisPendens',
         'notes': f"Filed: {prop.get('date_filed','')} | Docket: {prop.get('docket','')}"
@@ -274,7 +295,7 @@ def run():
         print(f'Login failed: {e}')
         return
     props = scrape_properties(session)
-    print(f'Scraped {len(props)} properties in target counties, {len([p for p in props if p.get("docket") not in seen])} new')
+    print(f'Scraped {len(props)} properties in target counties')
     if not props:
         print('Nothing to process.')
         return
