@@ -212,90 +212,125 @@ def scrape_with_playwright():
 
         print('Logged in to NJLisPendens successfully')
 
-        page_num = 0
-        while True:
-            url = f'https://www.njlispendens.com/member/property?per_page=50&cp={page_num}'
-            page.goto(url, wait_until='domcontentloaded')
-            page.wait_for_timeout(2000)
+        # After login, go to property search page and click Search with no filters
+        page.goto('https://www.njlispendens.com/member/property', wait_until='domcontentloaded')
+        page.wait_for_timeout(3000)
+        print(f'Property page URL: {page.url}')
 
-            # Re-check login in case session expired mid-run
-            if 'member/login' in page.url:
-                print('Session expired mid-run, re-logging in...')
-                if not do_login(page):
-                    print('Re-login failed, stopping scrape')
-                    break
-                page.goto(url, wait_until='domcontentloaded')
-                page.wait_for_timeout(2000)
+        # Debug: print page structure to find the right selectors
+        body_text = page.inner_text('body')[:1000]
+        print(f'Page body preview: {body_text[:500]}')
 
-            cards = page.query_selector_all('.pop-row')
-            print(f'Page {page_num}: found {len(cards)} cards')
+        # Try to find and click search/submit button
+        search_btn = page.query_selector('input[type="submit"], button[type="submit"], .search-btn, #search-btn, input[value="Search"], button:has-text("Search")')
+        if search_btn:
+            print(f'Found search button: {search_btn.get_attribute("class")} / {search_btn.get_attribute("value")}')
+            search_btn.click()
+            page.wait_for_timeout(3000)
+            print(f'After search click URL: {page.url}')
+        else:
+            print('No search button found, trying form submit...')
+            # Try submitting any form on the page
+            form = page.query_selector('form')
+            if form:
+                form.evaluate('f => f.submit()')
+                page.wait_for_timeout(3000)
+                print(f'After form submit URL: {page.url}')
 
-            if not cards:
-                # Try alternate selectors
-                cards = page.query_selector_all('.property-row, .listing-row, tr.data-row')
-                print(f'Page {page_num}: alternate selector found {len(cards)} cards')
+        # Now try to find property cards with various selectors
+        all_selectors = [
+            '.pop-row',
+            '.property-row',
+            '.listing-row',
+            'tr.data-row',
+            'table tbody tr',
+            '.result-row',
+            '.record-row',
+            '.item-row',
+            'div.row',
+            '.card',
+        ]
 
-            if not cards:
-                print(f'No cards on page {page_num} - stopping')
+        cards = []
+        used_selector = ''
+        for sel in all_selectors:
+            found = page.query_selector_all(sel)
+            if found and len(found) > 0:
+                cards = found
+                used_selector = sel
+                print(f'Found {len(cards)} cards with selector: {sel}')
                 break
 
-            stop_early = False
-            for card in cards:
-                try:
-                    text = card.inner_text()
+        if not cards:
+            # Debug: dump page HTML structure
+            html_snippet = page.inner_html('body')[:2000]
+            print(f'No cards found with any selector')
+            print(f'HTML structure: {html_snippet[:1500]}')
+            # Also print all table/div classes
+            classes = page.evaluate('''() => {
+                const els = document.querySelectorAll('table, div[class], tr[class]');
+                return Array.from(els).slice(0, 30).map(e => e.tagName + '.' + e.className).join(', ');
+            }''')
+            print(f'Page elements: {classes}')
+            browser.close()
+            return properties
 
-                    # Extract county
-                    county_m = re.search(r'County:\s*([A-Za-z]+)', text)
-                    county = county_m.group(1).strip() if county_m else ''
-                    if county not in TARGET_COUNTIES:
-                        continue
+        print(f'Processing {len(cards)} cards with selector: {used_selector}')
 
-                    # Extract file date
-                    date_m = re.search(r'File Date:\s*(\d{1,2}/\d{1,2}/\d{4})', text)
-                    if not date_m:
-                        continue
-                    file_date = datetime.strptime(date_m.group(1), '%m/%d/%Y')
-                    if file_date < cutoff:
-                        stop_early = True
-                        continue
-                    days_old = (datetime.now() - file_date).days
+        for card in cards:
+            try:
+                text = card.inner_text()
 
-                    # Extract docket
-                    docket_m = re.search(r'Docket(?:\s*No\.?)?:\s*([A-Z0-9\-]+)', text, re.I)
-                    docket = docket_m.group(1).strip() if docket_m else ''
+                # Extract county
+                county_m = re.search(r'County:\s*([A-Za-z]+)', text)
+                county = county_m.group(1).strip() if county_m else ''
+                if county and county not in TARGET_COUNTIES:
+                    continue
 
-                    # Extract city + zip
-                    city_m = re.search(r'([A-Za-z\s]+),\s*NJ\s*(\d{5})', text)
-                    city = city_m.group(1).strip() if city_m else ''
-                    zip_code = city_m.group(2) if city_m else ''
+                # Extract file date
+                date_m = re.search(r'File Date:\s*(\d{1,2}/\d{1,2}/\d{4})', text)
+                if not date_m:
+                    # Try alternate date patterns
+                    date_m = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', text)
+                if not date_m:
+                    continue
+                file_date = datetime.strptime(date_m.group(1), '%m/%d/%Y')
+                if file_date < cutoff:
+                    continue
+                days_old = (datetime.now() - file_date).days
 
-                    # Extract mortgage amount
-                    mort_m = re.search(r'Orig(?:inal)?\s+Mortgage:\s*\$?([\d,\.]+)', text, re.I)
-                    mortgage = mort_m.group(1).replace(',', '') if mort_m else '0'
+                # Extract docket
+                docket_m = re.search(r'Docket(?:\s*No\.?)?:\s*([A-Z0-9\-]+)', text, re.I)
+                docket = docket_m.group(1).strip() if docket_m else ''
 
-                    score = kps_score(0, float(mortgage) if mortgage else 0, days_old, city)
+                # Extract city + zip
+                city_m = re.search(r'([A-Za-z\s]+),\s*NJ\s*(\d{5})', text)
+                city = city_m.group(1).strip() if city_m else ''
+                zip_code = city_m.group(2) if city_m else ''
 
-                    properties.append({
-                        'county': county,
-                        'date': date_m.group(1),
-                        'docket': docket,
-                        'city': city,
-                        'zip': zip_code,
-                        'mortgage': mortgage,
-                        'score': score,
-                        'days_old': days_old,
-                    })
-                    print(f'  Found: {docket} | {city} ({county}) | Score: {score} | Filed: {date_m.group(1)}')
-                except Exception as e:
-                    print(f'  Card parse error: {e}')
+                # Extract mortgage amount
+                mort_m = re.search(r'Orig(?:inal)?\s+Mortgage:\s*\$?([\d,\.]+)', text, re.I)
+                mortgage = mort_m.group(1).replace(',', '') if mort_m else '0'
 
-            if stop_early:
-                print('Reached properties older than cutoff - stopping pagination')
-                break
-            page_num += 1
+                score = kps_score(0, float(mortgage) if mortgage else 0, days_old, city)
+
+                properties.append({
+                    'county': county,
+                    'date': date_m.group(1),
+                    'docket': docket,
+                    'city': city,
+                    'zip': zip_code,
+                    'mortgage': mortgage,
+                    'score': score,
+                    'days_old': days_old,
+                })
+                print(f'  Found: {docket} | {city} ({county}) | Score: {score} | Filed: {date_m.group(1)}')
+            except Exception as e:
+                print(f'  Card parse error: {e}')
 
         browser.close()
     return properties
+
 
 def main():
     print(f'NJ Foreclosure Bot - {datetime.now()} | TEST_MODE={TEST_MODE} | LOOKBACK_DAYS={LOOKBACK_DAYS}')
