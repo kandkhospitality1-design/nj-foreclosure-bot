@@ -4,7 +4,7 @@ import json
 import time
 import requests
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 NJ_USER        = os.environ['NJ_USERNAME']
 NJ_PASS        = os.environ['NJ_PASSWORD']
@@ -98,43 +98,18 @@ def save_seen(seen):
         json.dump(list(seen), f)
 
 
-def nj_login():
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0'})
-    r = session.get('https://www.njlispendens.com/member/login')
-    soup = BeautifulSoup(r.text, 'html.parser')
-    attempt = ''
-    inp = soup.find('input', {'name': 'login_attempt_id'})
-    if inp:
-        attempt = inp.get('value', '')
-    data = {
-        'amember_login': NJ_USER,
-        'amember_pass': NJ_PASS,
-        'login_attempt_id': attempt,
-        'amember_redirect_url': '/member/property'
-    }
-    r2 = session.post('https://www.njlispendens.com/member/login', data=data, allow_redirects=True)
-    if 'logout' in r2.text.lower():
-        print('Logged in to NJLisPendens')
-    else:
-        print(f'WARNING: Login may have failed - no logout link found')
-        print(f'Login status: {r2.status_code} | URL: {r2.url}')
-    return session
-
-
-def parse_card(card):
-    text = card.get_text(separator=' ', strip=True)
-    date_m = re.search(r'File Date[:\s]+([\d\-/]+)', text)
+def parse_card_text(text):
+    date_m  = re.search(r'File Date[:\s]+([\d\-/]+)', text)
     docket_m = re.search(r'Docket No[:\s]+(\S+)', text)
     county_m = re.search(r'County[:\s]+([^\n\t]+)', text)
-    city_m = re.search(r'([A-Za-z][A-Za-z\s]+)\s+NJ\s+\d{5}', text)
-    zip_m = re.search(r'NJ\s+(\d{5})', text)
-    mort_m = re.search(r'Orig Mortgage[:\s]+([\d,]+)', text)
-    date_str = date_m.group(1).strip() if date_m else ''
-    docket = docket_m.group(1).strip() if docket_m else ''
-    county = county_m.group(1).strip() if county_m else ''
-    city = city_m.group(1).strip() if city_m else ''
-    zip_code = zip_m.group(1).strip() if zip_m else ''
+    city_m  = re.search(r'([A-Za-z][A-Za-z\s]+)\s+NJ\s+\d{5}', text)
+    zip_m   = re.search(r'NJ\s+(\d{5})', text)
+    mort_m  = re.search(r'Orig Mortgage[:\s]+([\d,]+)', text)
+    date_str  = date_m.group(1).strip()  if date_m  else ''
+    docket    = docket_m.group(1).strip() if docket_m else ''
+    county    = county_m.group(1).strip() if county_m else ''
+    city      = city_m.group(1).strip()  if city_m  else ''
+    zip_code  = zip_m.group(1).strip()   if zip_m   else ''
     loan_balance = 0
     if mort_m:
         try:
@@ -170,38 +145,52 @@ def parse_card(card):
     }
 
 
-def scrape_properties(session):
+def scrape_with_playwright():
     props = []
     cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS)
-    page = 0
-    while True:
-        url = f'https://www.njlispendens.com/member/property?per_page=50&cp={page}'
-        r = session.get(url)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        cards = soup.select('.pop-row')
-        if not cards:
-            print(f'No cards on page {page} - stopping pagination')
-            break
-        found_any = False
-        for card in cards:
-            try:
-                prop = parse_card(card)
-                county = prop.get('county', '')
-                filed_date = prop.get('filed_date', datetime.min)
-                if county not in TARGET_COUNTIES:
-                    continue
-                if filed_date < cutoff:
-                    continue
-                found_any = True
-                props.append(prop)
-                print(f'  Found: {prop["docket"]} {prop["city"]} ({prop["county"]}) {prop["date_filed"]}')
-            except Exception as e:
-                print(f'Error parsing card: {e}')
-        if not found_any:
-            print(f'No matching cards on page {page} - stopping')
-            break
-        page += 1
-        time.sleep(1)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        ctx = browser.new_context()
+        page = ctx.new_page()
+        print('Navigating to login page...')
+        page.goto('https://www.njlispendens.com/member/login', wait_until='networkidle')
+        page.fill('input[name="amember_login"]', NJ_USER)
+        page.fill('input[name="amember_pass"]', NJ_PASS)
+        page.click('input[type="submit"], button[type="submit"]')
+        page.wait_for_load_state('networkidle')
+        if 'logout' in page.content().lower() or 'property' in page.title().lower():
+            print('Logged in to NJLisPendens')
+        else:
+            print(f'WARNING: login uncertain. Title: {page.title()} URL: {page.url}')
+        page_num = 0
+        while True:
+            url = f'https://www.njlispendens.com/member/property?per_page=50&cp={page_num}'
+            page.goto(url, wait_until='networkidle')
+            content = page.content()
+            cards = page.query_selector_all('.pop-row')
+            if not cards:
+                print(f'No cards on page {page_num} - stopping')
+                break
+            found_any = False
+            for card in cards:
+                try:
+                    text = card.inner_text()
+                    prop = parse_card_text(text)
+                    if prop['county'] not in TARGET_COUNTIES:
+                        continue
+                    if prop['filed_date'] < cutoff:
+                        continue
+                    found_any = True
+                    props.append(prop)
+                    print(f'  Found: {prop["docket"]} {prop["city"]} ({prop["county"]}) {prop["date_filed"]}')
+                except Exception as e:
+                    print(f'Card parse error: {e}')
+            if not found_any:
+                print(f'No matching cards on page {page_num} - stopping')
+                break
+            page_num += 1
+            time.sleep(1)
+        browser.close()
     return props
 
 
@@ -264,7 +253,7 @@ def process_prop(prop, seen):
             seen.add(docket)
         return False
     if TEST_MODE:
-        print(f'  TEST_MODE: would create lead, skip trace, drip (score={score})')
+        print(f'  TEST_MODE: would create lead + skip trace + drip (score={score})')
         if docket:
             seen.add(docket)
         return True
@@ -289,12 +278,7 @@ def run():
     else:
         seen = load_seen()
     print(f'Loaded {len(seen)} seen dockets')
-    try:
-        session = nj_login()
-    except Exception as e:
-        print(f'Login failed: {e}')
-        return
-    props = scrape_properties(session)
+    props = scrape_with_playwright()
     print(f'Scraped {len(props)} properties in target counties')
     if not props:
         print('Nothing to process.')
