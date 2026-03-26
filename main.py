@@ -579,6 +579,7 @@ def scrape_all():
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-blink-features=AutomationControlled',
+                '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
             ]
         )
