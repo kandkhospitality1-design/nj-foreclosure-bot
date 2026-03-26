@@ -153,7 +153,7 @@ def lookup_address_by_block_lot(county, block, lot):
             if street:
                 return {'address': street, 'city': city, 'zip': zip_code}
     except Exception as e:
-        print(f'  Address lookup error (block/lot, flush=True): {e}')
+        print(f'  Address lookup error (block/lot): {e}')
     return None
 
 
@@ -175,7 +175,7 @@ def lookup_address_by_name(county, last_name, municipality):
             if street:
                 return {'address': street, 'city': city, 'zip': zip_code}
     except Exception as e:
-        print(f'  Address lookup error (name, flush=True): {e}')
+        print(f'  Address lookup error (name): {e}')
     return None
 
 
@@ -256,7 +256,7 @@ def scrape_essex(page, from_date_str, to_date_str):
             # Precise selectors Ã¢ÂÂ only real lis pendens data rows
             rows = page.query_selector_all('tr.itemstyle, tr.altitemstyle')
 
-            print(f'    Essex {doc_label} page {page_num}: {len(rows, flush=True)} rows')
+            print(f'    Essex {doc_label} page {page_num}: {len(rows)} rows')
 
             for row in rows:
                 try:
@@ -364,7 +364,7 @@ def scrape_union(page, from_date_str, to_date_str):
 
         rows = page.query_selector_all('table tr')
         data_rows = [r for r in rows if r.query_selector('td')]
-        print(f'    Union: {len(data_rows, flush=True)} rows')
+        print(f'    Union: {len(data_rows)} rows')
 
         for row in data_rows:
             try:
@@ -422,7 +422,7 @@ def scrape_passaic(page, from_date_str, to_date_str):
         except Exception as e:
             print(f'    Passaic URL failed: {e}', flush=True)
     
-    print('  Passaic County: online portal not reliably scrapeable - skipping (in-person only, flush=True)')
+    print('  Passaic County: online portal not reliably scrapeable - skipping (in-person only)')
     return records
 
 
@@ -603,7 +603,7 @@ def scrape_all():
         print('\n=== Scraping Essex County ===', flush=True)
         try:
             essex_records = scrape_essex(page, from_str, to_str)
-            print(f'  Essex raw records: {len(essex_records, flush=True)}')
+            print(f'  Essex raw records: {len(essex_records)}')
             all_records.extend(essex_records)
         except Exception as e:
             print(f'  Essex scrape error: {e}', flush=True)
@@ -612,7 +612,7 @@ def scrape_all():
         print('\n=== Scraping Union County ===', flush=True)
         try:
             union_records = scrape_union(page, from_str, to_str)
-            print(f'  Union raw records: {len(union_records, flush=True)}')
+            print(f'  Union raw records: {len(union_records)}')
             all_records.extend(union_records)
         except Exception as e:
             print(f'  Union scrape error: {e}', flush=True)
@@ -621,7 +621,7 @@ def scrape_all():
         print('\n=== Scraping Passaic County ===', flush=True)
         try:
             passaic_records = scrape_passaic(page, from_str, to_str)
-            print(f'  Passaic raw records: {len(passaic_records, flush=True)}')
+            print(f'  Passaic raw records: {len(passaic_records)}')
             all_records.extend(passaic_records)
         except Exception as e:
             print(f'  Passaic scrape error: {e}', flush=True)
@@ -637,7 +637,7 @@ def scrape_all():
             seen_instruments.add(key)
             unique_records.append(r)
 
-    print(f'\nTotal unique records: {len(unique_records, flush=True)}')
+    print(f'\nTotal unique records: {len(unique_records)}')
 
     # Enrich with addresses
     print('\nEnriching addresses via NJ MOD-IV...', flush=True)
@@ -665,19 +665,19 @@ def scrape_all():
 def main():
     print(f'\nNJ Foreclosure Bot v2 ÃÂ¢ÃÂÃÂ {datetime.now()}')
     print(f'TEST_MODE={TEST_MODE} | LOOKBACK_DAYS={LOOKBACK_DAYS}', flush=True)
-    print('Source: Essex/Union/Passaic County PRESS portals (direct, flush=True)')
+    print('Source: Essex/Union/Passaic County PRESS portals (direct)')
     print('ÃÂ¢ÃÂÃÂ' * 60, flush=True)
 
     seen = set() if TEST_MODE else load_seen()
-    print(f'Seen cache: {len(seen, flush=True)} instruments\n')
+    print(f'Seen cache: {len(seen)} instruments\n')
 
     records = scrape_all()
-    print(f'\nScraped {len(records, flush=True)} total records')
+    print(f'\nScraped {len(records)} total records')
 
     new_records = [r for r in records if
                    (r.get('instrument_number') or
                     f"{r['county']}-{r['name']}-{r['date']}") not in seen]
-    print(f'New records to process: {len(new_records, flush=True)}')
+    print(f'New records to process: {len(new_records)}')
 
     if not new_records:
         print('Nothing new to process.', flush=True)
@@ -687,7 +687,7 @@ def main():
         key   = prop.get('instrument_number') or f"{prop['county']}-{prop['name']}-{prop['date']}"
         score = prop['score']
 
-        print(f'\nProcessing: {prop["name"]} | {prop.get("address","(no addr, flush=True)")} '
+        print(f'\nProcessing: {prop["name"]} | {prop.get("address","(no addr)")} '
               f'{prop["city"]}, NJ {prop.get("zip","")} | '
               f'{prop["county"]} | Filed: {prop["date"]} | Score: {score}')
 
@@ -698,7 +698,7 @@ def main():
 
         if TEST_MODE:
             print(f'  TEST MODE - would create lead + skip trace + enroll drip', flush=True)
-            print(f'  Full record: {json.dumps(prop, indent=2, flush=True)}')
+            print(f'  Full record: {json.dumps(prop, indent=2)}')
             seen.add(key)
             continue
 
@@ -714,7 +714,7 @@ def main():
     if not TEST_MODE:
         save_seen(seen)
 
-    print(f'\nDone. Processed {len(new_records, flush=True)} records.')
+    print(f'\nDone. Processed {len(new_records)} records.')
 
 
 if __name__ == '__main__':
