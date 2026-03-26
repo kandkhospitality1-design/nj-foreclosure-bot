@@ -480,8 +480,7 @@ def create_lead(prop):
     last  = ' '.join(name_parts[1:]) if len(name_parts) > 1 else 'Owner'
 
     payload = {
-        'firstName':  first,
-        'lastName':   last,
+        'name':       f"{first} {last}",
         'address':    prop.get('address', ''),
         'city':       prop.get('city', ''),
         'state':      'NJ',
