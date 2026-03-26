@@ -480,12 +480,20 @@ def create_lead(prop):
     last  = ' '.join(name_parts[1:]) if len(name_parts) > 1 else 'Owner'
 
     payload = {
-        'name':       f"{first} {last}",
-        'address':    prop.get('address', ''),
-        'city':       prop.get('city', ''),
-        'state':      'NJ',
-        'zip':        prop.get('zip', ''),
-        'leadSource': 'NJLisPendens-Direct',
+        'title':          f"{first} {last}",
+        'address':        prop.get('address', ''),
+        'city':           prop.get('city', ''),
+        'state':          'NJ',
+        'zip':            prop.get('zip', ''),
+        'crmQuestionId':  '5a2e0dca067911531aa76288',
+        'marketId':       '69bb084f8cbe02c74aa612e2',
+        'phoneNumber':    '',
+        'email':          '',
+        'secondaryContact': [],
+        'latitude':       '',
+        'longitude':      '',
+        'ownerName1':     f"{first} {last}",
+        'ownerMailingAddress': prop.get('address', ''),
         'notes': (
             f"County: {prop.get('county')} | "
             f"Instrument: {prop.get('instrument_number')} | "
