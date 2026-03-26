@@ -1,4 +1,9 @@
 import sys
+
+import os
+os.environ['PYTHONUNBUFFERED'] = '1'
+sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
+
 sys.stdout.reconfigure(line_buffering=True)
 """
 NJ Foreclosure Bot - v2
