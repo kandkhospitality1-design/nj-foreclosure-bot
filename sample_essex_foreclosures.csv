@@ -1,41 +1,34 @@
 name,address,city,state,zip,county,filing_date,lender,instrument_number,doc_type,block,lot
-  Smith John A,123 MAIN ST,Newark,NJ,07102,Essex,03/01/2026,Wells Fargo Bank NA,LP-2026-00301,LIS PENDENS FORECLOSURE,01234,0015
-  Rodriguez Maria L,456 BROAD AVE,East Orange,NJ,07018,Essex,03/01/2026,US Bank Trust NA,LP-2026-00302,LIS PENDENS FORECLOSURE,00892,0003
-  Williams Terrence,78 CLINTON PL,Irvington,NJ,07111,Essex,03/02/2026,Nationstar Mortgage LLC,LP-2026-00310,LIS PENDENS IN REM,03456,0021
-  Johnson Patricia,,Belleville,NJ,,Essex,03/02/2026,PHH Mortgage Corp,LP-2026-00311,LIS PENDENS RECOVERY,,
-  Davis Marcus L,22 PARK ST,Bloomfield,NJ,07003,Essex,03/03/2026,Deutsche Bank Trust,LP-2026-00318,LIS PENDENS FORECLOSURE,02100,0009
-  Brown Angela R,891 S ORANGE AVE,Newark,NJ,07106,Essex,03/03/2026,Bank Of America NA,LP-2026-00319,LIS PENDENS FORECLOSURE,04501,0032
-  Taylor Robert,,Montclair,NJ,,Essex,03/04/2026,JPMorgan Chase Bank NA,LP-2026-00325,LIS PENDENS FORECLOSURE,,
-  Martinez Carlos E,15 GROVE ST,East Orange,NJ,07017,Essex,03/04/2026,Specialized Loan Servicing,LP-2026-00326,LIS PENDENS IN REM,01789,0011
-  Thomas Keisha D,200 CHANCELLOR AVE,Irvington,NJ,07111,Essex,03/05/2026,Wilmington Savings Fund,LP-2026-00330,LIS PENDENS FORECLOSURE,02890,0044
-  Anderson James,,Newark,NJ,,Essex,03/05/2026,Citibank NA,LP-2026-00331,LIS PENDENS FORECLOSURE,,
-  Wilson Donna M,55 SANFORD ST,East Orange,NJ,07018,Essex,03/06/2026,NewRez LLC,LP-2026-00338,LIS PENDENS FORECLOSURE,00456,0007
-  Moore Tyrone,310 LYONS AVE,Newark,NJ,07112,Essex,03/06/2026,Lakeview Loan Servicing,LP-2026-00339,LIS PENDENS IN REM,05123,0019
-  Jackson Shirley A,42 ELMWOOD AVE,Bloomfield,NJ,07003,Essex,03/07/2026,Freedom Mortgage Corp,LP-2026-00345,LIS PENDENS FORECLOSURE,01567,0028
-  White David,,West Orange,NJ,,Essex,03/07/2026,Ocwen Financial Corp,LP-2026-00346,LIS PENDENS RECOVERY,,
-  Harris Linda K,88 SPRINGFIELD AVE,Newark,NJ,07103,Essex,03/08/2026,Select Portfolio Servicing,LP-2026-00352,LIS PENDENS FORECLOSURE,03200,0013
-  Martin Eric J,671 CENTRAL AVE,East Orange,NJ,07018,Essex,03/08/2026,Shellpoint Mortgage Servicing,LP-2026-00353,LIS PENDENS FORECLOSURE,01023,0005
-  Thompson Crystal,19 MAPLE AVE,Irvington,NJ,07111,Essex,03/09/2026,US Bank NA,LP-2026-00360,LIS PENDENS FORECLOSURE,04100,0037
-  Garcia Jose R,,Nutley,NJ,,Essex,03/09/2026,Flagstar Bank FSB,LP-2026-00361,LIS PENDENS IN REM,,
-  Clark Raymond,145 S 10TH ST,Newark,NJ,07107,Essex,03/10/2026,Pennymac Loan Services,LP-2026-00368,LIS PENDENS FORECLOSURE,02345,0022
-  Lewis Sharon A,33 PROSPECT ST,Bloomfield,NJ,07003,Essex,03/10/2026,Caliber Home Loans,LP-2026-00369,LIS PENDENS FORECLOSURE,00678,0016
-  Robinson Dwayne,502 AVON AVE,Newark,NJ,07108,Essex,03/11/2026,Carrington Mortgage Services,LP-2026-00375,LIS PENDENS FORECLOSURE,05890,0041
-  Lee Carmen,,East Orange,NJ,,Essex,03/11/2026,M&T Bank,LP-2026-00376,LIS PENDENS RECOVERY,,
-  Walker Anthony P,77 HALSTED ST,East Orange,NJ,07018,Essex,03/12/2026,Bayview Loan Servicing,LP-2026-00382,LIS PENDENS FORECLOSURE,01456,0008
-  Hall Denise M,260 BROADWAY,Newark,NJ,07104,Essex,03/12/2026,Wells Fargo Bank NA,LP-2026-00383,LIS PENDENS IN REM,03678,0025
-  Young Kenneth,14 BERKSHIRE PL,Irvington,NJ,07111,Essex,03/13/2026,Nationstar Mortgage LLC,LP-2026-00390,LIS PENDENS FORECLOSURE,02567,0033
-  Allen Brenda,,Belleville,NJ,,Essex,03/13/2026,Bank Of America NA,LP-2026-00391,LIS PENDENS FORECLOSURE,,
-  King Michael T,93 MUNN AVE,East Orange,NJ,07018,Essex,03/14/2026,JPMorgan Chase Bank NA,LP-2026-00398,LIS PENDENS FORECLOSURE,00234,0012
-  Wright Tanya L,411 ELIZABETH AVE,Newark,NJ,07112,Essex,03/14/2026,Deutsche Bank Trust,LP-2026-00399,LIS PENDENS IN REM,04890,0047
-  Scott Derrick,,Montclair,NJ,,Essex,03/15/2026,Wilmington Trust NA,LP-2026-00405,LIS PENDENS FORECLOSURE,,
-  Green Sandra J,28 WATCHUNG AVE,Bloomfield,NJ,07003,Essex,03/15/2026,Citibank NA,LP-2026-00406,LIS PENDENS FORECLOSURE,01890,0020
-  Adams Wayne,167 N CLINTON ST,East Orange,NJ,07017,Essex,03/16/2026,PHH Mortgage Corp,LP-2026-00412,LIS PENDENS FORECLOSURE,02234,0006
-  Nelson Vanessa,,Irvington,NJ,,Essex,03/16/2026,Specialized Loan Servicing,LP-2026-00413,LIS PENDENS RECOVERY,,
-  Carter Jerome A,305 S HARRISON ST,East Orange,NJ,07018,Essex,03/17/2026,Freedom Mortgage Corp,LP-2026-00420,LIS PENDENS FORECLOSURE,01678,0029
-  Mitchell Diane,52 N 6TH ST,Newark,NJ,07107,Essex,03/17/2026,NewRez LLC,LP-2026-00421,LIS PENDENS IN REM,03890,0014
-  Perez Juan,,West Orange,NJ,,Essex,03/18/2026,Lakeview Loan Servicing,LP-2026-00428,LIS PENDENS FORECLOSURE,,
-  Roberts Felicia M,189 RIDGEWOOD AVE,Newark,NJ,07108,Essex,03/18/2026,Select Portfolio Servicing,LP-2026-00429,LIS PENDENS FORECLOSURE,05234,0038
-  Turner Kevin D,63 WILLIAM ST,Bloomfield,NJ,07003,Essex,03/19/2026,Shellpoint Mortgage Servicing,LP-2026-00435,LIS PENDENS FORECLOSURE,00123,0024
-  Phillips Lakesha,,Newark,NJ,,Essex,03/19/2026,US Bank NA,LP-2026-00436,LIS PENDENS IN REM,,
-  Campbell Brian A,440 BERGEN ST,Newark,NJ,07108,Essex,03/20/2026,Pennymac Loan Services,LP-2026-00442,LIS PENDENS FORECLOSURE,04567,0031
-  Edwards Cynthia R,17 BURNETT ST,East Orange,NJ,07017,Essex,03/20/2026,Caliber Home Loans,LP-2026-00443,LIS PENDENS FORECLOSURE,01345,0010
+"Register Of Deeds	
+ Records Search
+	
+	
+Records Search 			
+
+
+
+Search     |     Search Results     |     View Image
+No Results Found",,Register Of Deeds,NJ,,Essex,Register of Deeds,"Register of Deeds	
+ Records Search
+	
+	
+Records Search 			
+
+
+
+Search     |     Search Results     |     View Image
+No results found","Register of Deeds	
+ Records Search",LIS PENDENS FORECLOSURE,,Property Records
+"Register Of Deeds	
+ Records Search
+	
+	
+Records Search 			
+
+
+
+Search     |     Search Results     |     View Image
+No Results Found",,,NJ,,Essex,Register of Deeds,"Register of Deeds	
+ Records Search",Register of Deeds,LIS PENDENS FORECLOSURE,Property Records,Property Records
+Register Of Deeds,,Property Records,NJ,,Essex,Property Records,Register of Deeds,,LIS PENDENS FORECLOSURE,Records Search,
+Terms Of Use,,,NJ,,Essex,Rel 2025-1(a),"Site compatible with Edge, Internet Explorer, Chrome, Firefox (SUNRISE-APP)	Rel 2025-1(a)","Site compatible with Edge, Internet Explorer, Chrome, Firefox (SUNRISE-APP)",LIS PENDENS FORECLOSURE,,
