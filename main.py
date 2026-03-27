@@ -11,7 +11,7 @@ import requests
 from datetime import datetime, timedelta
 from playwright.sync_api import sync_playwright
 
-# ── Config ──
+# Config
 LOOKBACK_DAYS = int(os.environ.get('LOOKBACK_DAYS', '30'))
 OUTPUT_CSV    = os.environ.get('OUTPUT_CSV', 'essex_foreclosures.csv')
 MODIV_API     = 'https://data.nj.gov/resource/9qqx-mnbd.json'
@@ -21,11 +21,14 @@ JUNK_PATTERNS = [
     'town name', 'register of deeds', 'property records',
     'terms of use', 'site compatible', 'records search',
     'rel 20', 'sunrise', 'search results', 'no records', 'page of',
+    'home', 'faqs', 'contact us', 'view image',
 ]
 
 def is_junk_row(text):
     t = text.lower().strip()
     if not t:
+        return True
+    if len(t) > 200:
         return True
     for pat in JUNK_PATTERNS:
         if pat in t:
@@ -117,46 +120,69 @@ def reset_to_search(page, url):
     except Exception:
         pass
 
-def parse_row(texts, row_num, page_num):
-    """
-    Essex PRESS table columns (0-indexed):
-      0: row number
-      1: doc type code
-      2: direct party (borrower)
-      3: indirect party (lender)
-      4: instrument number
-      5: recorded date  (MM/DD/YYYY)
-      6: town name
-      7: block
-      8: lot
-    Try date-based detection first, fall back to fixed indices.
-    """
+def get_data_rows(page):
+    grid_selectors = [
+        '#ctl00_ContentPlaceHolder1_GridView1',
+        '#ctl00_ContentPlaceHolder1_gvResults',
+        '#ctl00_ContentPlaceHolder1_dgResults',
+        'table[id*="GridView"]',
+        'table[id*="gv"]',
+        'table[id*="Results"]',
+    ]
+    for sel in grid_selectors:
+        try:
+            grid = page.query_selector(sel)
+            if grid:
+                rows = grid.query_selector_all('tr')
+                data_rows = [r for r in rows if r.query_selector('td')]
+                if data_rows:
+                    print(f'  Found result grid via {sel}: {len(data_rows)} rows')
+                    return data_rows
+        except Exception:
+            pass
+
+    all_tables = page.query_selector_all('table')
+    best_table = None
+    best_count = 0
+    for tbl in all_tables:
+        rows = tbl.query_selector_all('tr')
+        data_rows = [r for r in rows if r.query_selector('td')]
+        has_date = False
+        for row in data_rows[:10]:
+            cells = row.query_selector_all('td')
+            for cell in cells:
+                txt = cell.inner_text().strip()
+                if is_valid_date(txt):
+                    has_date = True
+                    break
+            if has_date:
+                break
+        if has_date and len(data_rows) > best_count:
+            best_count = len(data_rows)
+            best_table = data_rows
+
+    if best_table:
+        print(f'  Found result table by date-scan: {len(best_table)} rows')
+        return best_table
+
+    all_rows = page.query_selector_all('table tr')
+    rows = [r for r in all_rows if r.query_selector('td')]
+    print(f'  Fallback: using all {len(rows)} rows from all tables')
+    return rows
+
+def parse_row(texts):
     if len(texts) < 6:
         return None
 
-    # --- method 1: find date column by pattern ---
     date_col = None
     for i, t in enumerate(texts):
         if is_valid_date(t):
             date_col = i
             break
 
-    # --- method 2: fixed column layout (col 5 = date) ---
-    if date_col is None:
-        if len(texts) >= 9 and is_valid_date(texts[5]):
-            date_col = 5
-        elif len(texts) >= 7 and is_valid_date(texts[4]):
-            date_col = 4
-
-    # Diagnostic for first 3 rows on page 1
-    if page_num == 1 and row_num < 3:
-        print(f'  [diag] row{row_num} cols={len(texts)} date_col={date_col} texts={texts[:9]}')
-
     if date_col is None:
         return None
 
-    # Need at least 3 cols before date (direct, indirect, instr)
-    # and at least 1 col after (town)
     if date_col < 3 or date_col + 1 >= len(texts):
         return None
 
@@ -216,8 +242,11 @@ def scrape_essex(page, from_date_str, to_date_str):
             reset_to_search(page, url)
             continue
 
-        body = page.inner_text('body')
-        if 'no records' in body.lower() or 'returned 0' in body.lower():
+        body = page.inner_text('body').lower()
+        no_results = any(kw in body for kw in [
+            'no records', 'returned 0', 'no results found', '0 records'
+        ])
+        if no_results:
             print(f'  {doc_label}: 0 results')
             reset_to_search(page, url)
             continue
@@ -227,18 +256,16 @@ def scrape_essex(page, from_date_str, to_date_str):
 
         while True:
             page.wait_for_timeout(1500)
-            all_rows = page.query_selector_all('table tr')
-            rows     = [r for r in all_rows if r.query_selector('td')]
-            print(f'  Page {page_num}: {len(rows)} candidate rows')
+            rows = get_data_rows(page)
 
             page_records = 0
-            for row_num, row in enumerate(rows):
+            for row in rows:
                 try:
                     cells = row.query_selector_all('td')
                     if len(cells) < 5:
                         continue
                     texts = [c.inner_text().strip() for c in cells]
-                    rec = parse_row(texts, row_num, page_num)
+                    rec = parse_row(texts)
                     if rec:
                         rec['doc_type'] = doc_label
                         records.append(rec)
