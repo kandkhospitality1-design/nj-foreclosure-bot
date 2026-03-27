@@ -1,10 +1,11 @@
 """
-NJ Foreclosure Bot - Simplified (Essex County)
+NJ Foreclosure Bot - Essex County
 Scrapes Essex County PRESS for lis pendens foreclosure filings,
 looks up addresses via NJ MOD-IV tax data, outputs to CSV.
 """
 import csv
 import os
+import re
 import time
 import requests
 from datetime import datetime, timedelta
@@ -13,13 +14,29 @@ from playwright.sync_api import sync_playwright
 # ── Config ──
 LOOKBACK_DAYS = int(os.environ.get('LOOKBACK_DAYS', '30'))
 OUTPUT_CSV = os.environ.get('OUTPUT_CSV', 'essex_foreclosures.csv')
-
 MODIV_API = 'https://data.nj.gov/resource/9qqx-mnbd.json'
 
-# ── Address lookup via NJ MOD-IV ──
+JUNK_PATTERNS = [
+    'direct party', 'indirect party', 'instrument #', 'recorded',
+    'town name', 'register of deeds', 'property records', 'terms of use',
+    'site compatible', 'records search', 'rel 20', 'sunrise',
+    'type', 'search results', 'no records', 'page of',
+]
+
+def is_junk_row(text):
+    t = text.lower().strip()
+    if not t:
+        return True
+    for pat in JUNK_PATTERNS:
+        if pat in t:
+            return True
+    return False
+
+def is_valid_date(s):
+    import re as _re
+    return bool(_re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', s.strip()))
 
 def lookup_address_by_block_lot(block, lot):
-    """Query NJ MOD-IV for street address given block/lot in Essex County."""
     try:
         if not block or block == 'N/A' or not lot or lot == 'N/A':
             return None
@@ -39,9 +56,7 @@ def lookup_address_by_block_lot(block, lot):
         print(f'  Address lookup error (block/lot): {e}')
     return None
 
-
 def lookup_address_by_name(last_name, municipality):
-    """Fallback: search MOD-IV by owner name + municipality in Essex."""
     try:
         params = {
             '$where': (
@@ -63,23 +78,18 @@ def lookup_address_by_name(last_name, municipality):
         print(f'  Address lookup error (name): {e}')
     return None
 
-
 def enrich_address(record):
-    """Fill in address/zip using block/lot or name fallback."""
     block = record.get('block', '').strip()
     lot = record.get('lot', '').strip()
     city = record.get('city', '').strip()
     name = record.get('name', '').strip()
-
     if block and lot and block != 'N/A' and lot != 'N/A':
         result = lookup_address_by_block_lot(block, lot)
         if result:
             record['address'] = result['address']
             record['city'] = result.get('city') or city
             record['zip'] = result['zip']
-            print(f"  Found address via block/lot: {result['address']}, {result['city']}")
             return record
-
     if name and city:
         last_name = name.split()[-1] if name.split() else name
         result = lookup_address_by_name(last_name, city)
@@ -87,40 +97,32 @@ def enrich_address(record):
             record['address'] = result['address']
             record['city'] = result.get('city') or city
             record['zip'] = result['zip']
-            print(f"  Found address via name: {result['address']}, {result['city']}")
-            return record
-
-    print(f'  No address found for {name} in {city}')
     return record
 
-
-# ── Essex County PRESS scraper ──
-
-def scrape_essex(page, from_date_str, to_date_str):
-    """
-    Scrape Essex County PRESS for lis pendens foreclosure filings.
-    Returns list of dicts with filing data.
-    """
-    records = []
-    url = 'https://press.essexregister.com/prodpress/clerk/ClerkHome.aspx?op=basic'
-    print(f'Navigating to Essex PRESS...')
+def reset_to_search(page, url):
     page.goto(url, wait_until='domcontentloaded')
-    page.wait_for_timeout(3000)
-
-    # Dismiss disclaimer if present
+    page.wait_for_timeout(2000)
+    for sel in ['input[value="Close"]', 'button:has-text("Close")', 'input[value="I Agree"]', 'button:has-text("I Agree")']:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                page.wait_for_timeout(500)
+                break
+        except Exception:
+            pass
     try:
-        close_btn = page.query_selector('input[value="Close"], button:has-text("Close")')
-        if close_btn:
-            close_btn.click()
-            page.wait_for_timeout(500)
+        page.click('text=By Document Type', timeout=5000)
+        page.wait_for_timeout(500)
     except Exception:
         pass
 
-    # Click "By Document Type" tab
-    page.click('text=By Document Type')
-    page.wait_for_timeout(500)
+def scrape_essex(page, from_date_str, to_date_str):
+    records = []
+    url = 'https://press.essexregister.com/prodpress/clerk/ClerkHome.aspx?op=basic'
+    print('Navigating to Essex PRESS...')
+    reset_to_search(page, url)
 
-    # Search each lis pendens doc type
     doc_types = [
         ('23', 'LIS PENDENS FORECLOSURE'),
         ('21', 'LIS PENDENS IN REM'),
@@ -130,58 +132,66 @@ def scrape_essex(page, from_date_str, to_date_str):
 
     for doc_val, doc_label in doc_types:
         print(f'\n  Searching: {doc_label}...')
-        page.select_option('#ctl00_ContentPlaceHolder1_ddlDocTypeTab2', doc_val)
-        page.wait_for_timeout(300)
-        page.fill('#ctl00_ContentPlaceHolder1_txtFromTab2', from_date_str)
-        page.fill('#ctl00_ContentPlaceHolder1_txtToTab2', to_date_str)
-        page.click('#ctl00_ContentPlaceHolder1_btnSearchTab2')
-        page.wait_for_timeout(3000)
-
-        body = page.inner_text('body')
-        if 'No records' in body or 'returned 0' in body.lower():
-            print(f'  {doc_label}: 0 results')
-            page.goto(url, wait_until='domcontentloaded')
-            page.wait_for_timeout(1500)
-            try:
-                close_btn = page.query_selector('input[value="Close"], button:has-text("Close")')
-                if close_btn:
-                    close_btn.click()
-                    page.wait_for_timeout(300)
-            except Exception:
-                pass
-            page.click('text=By Document Type')
-            page.wait_for_timeout(500)
+        try:
+            page.select_option('#ctl00_ContentPlaceHolder1_ddlDocTypeTab2', doc_val)
+            page.wait_for_timeout(300)
+            page.fill('#ctl00_ContentPlaceHolder1_txtFromTab2', from_date_str)
+            page.fill('#ctl00_ContentPlaceHolder1_txtToTab2', to_date_str)
+            page.click('#ctl00_ContentPlaceHolder1_btnSearchTab2')
+            page.wait_for_timeout(4000)
+        except Exception as e:
+            print(f'  Search error for {doc_label}: {e}')
+            reset_to_search(page, url)
             continue
 
-        # Paginate through results
+        body = page.inner_text('body')
+        if 'no records' in body.lower() or 'returned 0' in body.lower():
+            print(f'  {doc_label}: 0 results')
+            reset_to_search(page, url)
+            continue
+
         page_num = 1
+        consecutive_empty = 0
         while True:
+            page.wait_for_timeout(1500)
             all_rows = page.query_selector_all('table tr')
             rows = [r for r in all_rows if r.query_selector('td')]
-            print(f'  Page {page_num}: {len(rows)} rows')
+            print(f'  Page {page_num}: {len(rows)} candidate rows')
 
+            page_records = 0
             for row in rows:
                 try:
                     cells = row.query_selector_all('td')
-                    if len(cells) < 4:
+                    if len(cells) < 5:
                         continue
                     texts = [c.inner_text().strip() for c in cells]
-                    direct_party = texts[1] if len(texts) > 1 else ''
-                    indirect_party = texts[2] if len(texts) > 2 else ''
-                    instrument_num = texts[3] if len(texts) > 3 else ''
-                    recorded_date = texts[4] if len(texts) > 4 else ''
-                    town = texts[5] if len(texts) > 5 else ''
-                    block = texts[6] if len(texts) > 6 else ''
-                    lot = texts[7] if len(texts) > 7 else ''
 
-                    if not direct_party or not recorded_date:
+                    date_col = None
+                    for i, t in enumerate(texts):
+                        if is_valid_date(t):
+                            date_col = i
+                            break
+                    if date_col is None or date_col < 3:
                         continue
-                    if 'direct party' in direct_party.lower():
+
+                    recorded_date  = texts[date_col]
+                    direct_party   = texts[date_col - 3].strip()
+                    indirect_party = texts[date_col - 2].strip()
+                    instrument_num = texts[date_col - 1].strip()
+                    town  = texts[date_col + 1].strip() if len(texts) > date_col + 1 else ''
+                    block = texts[date_col + 2].strip() if len(texts) > date_col + 2 else ''
+                    lot   = texts[date_col + 3].strip() if len(texts) > date_col + 3 else ''
+
+                    if is_junk_row(direct_party):
+                        continue
+                    if not direct_party or len(direct_party) < 2:
+                        continue
+                    if re.match(r'^[\d\s]+$', direct_party):
                         continue
 
                     records.append({
                         'name': direct_party.title(),
-                        'lender': indirect_party,
+                        'lender': indirect_party.title(),
                         'instrument_number': instrument_num,
                         'filing_date': recorded_date,
                         'city': town.title(),
@@ -193,60 +203,61 @@ def scrape_essex(page, from_date_str, to_date_str):
                         'county': 'Essex',
                         'doc_type': doc_label,
                     })
+                    page_records += 1
                 except Exception as e:
                     print(f'  Row parse error: {e}')
 
-            # Check for next page
-            next_link = page.query_selector('a:has-text("Next"), a[href*="page="]')
-            if next_link:
-                next_link.click()
-                page.wait_for_timeout(2000)
-                page_num += 1
+            print(f'  Page {page_num}: captured {page_records} records')
+
+            if page_records == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
             else:
+                consecutive_empty = 0
+
+            next_link = None
+            for sel in ['a:has-text("Next")', 'a:has-text(">>")', 'a:has-text(">")', 'input[value="Next"]', 'input[value=">"]']:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        next_link = el
+                        break
+                except Exception:
+                    pass
+
+            if next_link:
+                try:
+                    next_link.click()
+                    page.wait_for_timeout(3000)
+                    page_num += 1
+                except Exception as e:
+                    print(f'  Pagination error: {e}')
+                    break
+            else:
+                print(f'  No more pages for {doc_label}')
                 break
 
-        # Go back to search for next doc type
-        page.goto(url, wait_until='domcontentloaded')
-        page.wait_for_timeout(1500)
-        try:
-            close_btn = page.query_selector('input[value="Close"], button:has-text("Close")')
-            if close_btn:
-                close_btn.click()
-                page.wait_for_timeout(300)
-        except Exception:
-            pass
-        page.click('text=By Document Type')
-        page.wait_for_timeout(500)
+        reset_to_search(page, url)
 
     return records
 
-
-# ── Write results to CSV ──
-
 def write_csv(records, filename):
-    """Write records to a CSV file."""
     if not records:
         print('No records to write.')
         return
-    fieldnames = [
-        'name', 'address', 'city', 'state', 'zip', 'county',
-        'filing_date', 'lender', 'instrument_number', 'doc_type', 'block', 'lot'
-    ]
+    fieldnames = ['name', 'address', 'city', 'state', 'zip', 'county', 'filing_date', 'lender', 'instrument_number', 'doc_type', 'block', 'lot']
     with open(filename, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(records)
     print(f'\nWrote {len(records)} records to {filename}')
 
-
-# ── Main ──
-
 def main():
     print(f'\n=== NJ Foreclosure Bot (Essex County) ===')
     print(f'Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}')
     print(f'Lookback: {LOOKBACK_DAYS} day(s)')
     print('=' * 45)
-
     today = datetime.now()
     from_date = today - timedelta(days=LOOKBACK_DAYS)
     from_str = from_date.strftime('%m/%d/%Y')
@@ -254,24 +265,13 @@ def main():
     print(f'Date range: {from_str} to {to_str}\n')
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        )
-        ctx = browser.new_context(
-            user_agent=(
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
-            )
-        )
+        browser = pw.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'])
+        ctx = browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         page = ctx.new_page()
         records = scrape_essex(page, from_str, to_str)
         browser.close()
 
     print(f'\nScraped {len(records)} raw records')
-
-    # Deduplicate by instrument number
     seen = set()
     unique = []
     for r in records:
@@ -281,16 +281,13 @@ def main():
             unique.append(r)
     print(f'Unique records: {len(unique)}')
 
-    # Enrich with addresses from MOD-IV
     print('\nLooking up addresses via NJ MOD-IV tax data...')
     for rec in unique:
         enrich_address(rec)
-        time.sleep(0.3)  # be polite to the API
+        time.sleep(0.3)
 
-    # Write to CSV
     write_csv(unique, OUTPUT_CSV)
     print('\nDone!')
-
 
 if __name__ == '__main__':
     main()
