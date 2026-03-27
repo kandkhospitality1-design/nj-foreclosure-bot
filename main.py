@@ -1,214 +1,119 @@
-import sys
-
-import os
-os.environ['PYTHONUNBUFFERED'] = '1'
-sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
-
-sys.stdout.reconfigure(line_buffering=True)
 """
-NJ Foreclosure Bot - v2
-Sources: Essex County PRESS, Union County PRESS, Passaic County PRESS
-Replaces: njlispendens.com (login broken)
-
-Data collected per record:
-  name, address, city, state, zip, county, filing_date, lender, instrument_number
-
-Flow:
-  1. Scrape county PRESS sites for today's LIS PENDENS FORECLOSURE filings
-  2. For each record that has Block/Lot, look up street address via NJ MOD-IV tax API
-  3. If no Block/Lot (Essex often returns N/A), fall back to name+city lookup on tax API
-  4. Create lead in ReSimpli ÃÂ¢ÃÂÃÂ skip trace ÃÂ¢ÃÂÃÂ enroll drip
+NJ Foreclosure Bot - Simplified (Essex County)
+Scrapes Essex County PRESS for lis pendens foreclosure filings,
+looks up addresses via NJ MOD-IV tax data, outputs to CSV.
 """
 
+import csv
 import os
-import re
-import json
 import time
 import requests
 from datetime import datetime, timedelta
 from playwright.sync_api import sync_playwright
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Env vars (same names as before, NJ_USERNAME/NJ_PASSWORD no longer needed) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-RESIMPLI_TOKEN   = os.environ['RESIMPLI_TOKEN']
-SEEN_FILE        = 'seen_properties.json'
-TEST_MODE        = os.environ.get('TEST_MODE', 'false').lower() == 'true'
-LOOKBACK_DAYS    = int(os.environ.get('LOOKBACK_DAYS', '1'))   # default: today only
+# ── Config ──
+LOOKBACK_DAYS = int(os.environ.get('LOOKBACK_DAYS', '30'))
+OUTPUT_CSV = os.environ.get('OUTPUT_CSV', 'essex_foreclosures.csv')
 
-# ReSimpli drip IDs (unchanged from original)
-DRIP_HOT  = '69c2f816a121be22d81a6c85'
-DRIP_WARM = '69c2f97068818e6c3fa39cd5'
-DRIP_COLD = '69c30c665ea684747e339fa3'
+MODIV_API = 'https://data.nj.gov/resource/9qqx-mnbd.json'
 
-RESIMPLI_HEADERS = {
-    'Authorization': RESIMPLI_TOKEN,
-    'Content-Type': 'application/json'
-}
-RESIMPLI_BASE = 'https://live-api.resimpli.com/api/v4'
+# ── Address lookup via NJ MOD-IV ──
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ County PRESS portal configs ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-# Each entry: name, base_url, doc_type_value, uses_municipality_filter
-COUNTIES = [
-    {
-        'name': 'Essex',
-        'press_url': 'https://press.essexregister.com/prodpress/clerk/ClerkHome.aspx?op=basic',
-        'doc_type_value': '23',        # LIS PENDENS FORECLOSURE
-        'tab': 'Tab2',                 # "By Document Type" tab identifiers
-        'municipality_select_id': 'ctl00_ContentPlaceHolder1_ddlMunTab2',
-        'doctype_select_id':      'ctl00_ContentPlaceHolder1_ddlDocTypeTab2',
-        'from_date_id':           'ctl00_ContentPlaceHolder1_txtFromTab2',
-        'to_date_id':             'ctl00_ContentPlaceHolder1_txtToTab2',
-        'search_button_tab':      'Tab2',
-    },
-    {
-        'name': 'Union',
-        'press_url': 'https://clerk.ucnj.org/UCPA/DocIndex?s=type',
-        'type': 'union',   # handled separately - different UI
-    },
-    {
-        'name': 'Passaic',
-        'press_url': 'https://passaiccountyclerk.com/LandRecords/',
-        'type': 'passaic',  # handled separately
-    },
-]
-
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ NJ MOD-IV / tax assessor API (free, no key needed) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-NJ_TAX_API = 'https://api.njpropertyrecords.com/v1/properties'   # community endpoint
-# Fallback: direct county assessor lookups via NJ's MODIV dataset on data.nj.gov
-MODIV_API  = 'https://data.nj.gov/resource/9qqx-mnbd.json'
-
-
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-#  Scoring (unchanged from original)
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-
-def equity_score(ev, lb):
-    if not ev: return 0
-    p = (ev - lb) / ev * 100
-    if p >= 50: return 35
-    if p >= 40: return 30
-    if p >= 30: return 22
-    if p >= 20: return 14
-    if p >= 10: return 7
-    return 0
-
-def distress_score(days, tax=False, absentee=False, vacant=False):
-    pts = 10 if days <= 7 else 7 if days <= 30 else 4 if days <= 90 else 0
-    if tax:      pts += 8
-    if absentee: pts += 5
-    if vacant:   pts += 2
-    return min(pts, 25)
-
-def market_score(city):
-    hot  = {'newark', 'paterson', 'elizabeth', 'irvington'}
-    warm = {'east orange', 'belleville', 'bloomfield', 'nutley', 'west orange'}
-    c = city.lower().strip()
-    if c in hot:  return 20
-    if c in warm: return 15
-    return 10
-
-def deal_score(has_phone=False, prop_type='SFR', year_built=None, no_bankruptcy=True):
-    pts = 0
-    if has_phone:  pts += 5
-    if prop_type == 'SFR': pts += 5
-    elif prop_type in ('2-4', 'duplex', 'triplex'): pts += 4
-    if year_built and year_built < 1980: pts += 3
-    if no_bankruptcy: pts += 3
-    return min(pts, 20)
-
-def kps_score(ev, lb, days, city, **kwargs):
-    return (equity_score(ev, lb) + distress_score(days, **kwargs)
-            + market_score(city) + deal_score())
-
-
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-#  Address lookup via NJ MOD-IV open data
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-
-def lookup_address_by_block_lot(county, block, lot):
-    """Query NJ MOD-IV dataset for street address given county/block/lot."""
-    try:
-        county_code_map = {
-            'Atlantic': '01', 'Bergen': '02', 'Burlington': '03',
-            'Camden': '04', 'Cape May': '05', 'Cumberland': '06',
-            'Essex': '07', 'Gloucester': '08', 'Hudson': '09',
-            'Hunterdon': '10', 'Mercer': '11', 'Middlesex': '12',
-            'Monmouth': '13', 'Morris': '14', 'Ocean': '15',
-            'Passaic': '16', 'Salem': '17', 'Somerset': '18',
-            'Sussex': '19', 'Union': '20', 'Warren': '21',
-        }
-        cc = county_code_map.get(county, '')
-        if not cc or not block or block == 'N/A':
+def lookup_address_by_block_lot(block, lot):
+      """Query NJ MOD-IV for street address given block/lot in Essex County."""
+      try:
+                if not block or block == 'N/A' or not lot or lot == 'N/A':
+                              return None
+                          params = {
+                    '$where': f"county_code='07' AND block='{block.zfill(5)}' AND lot='{lot.zfill(4)}'",
+                    '$limit': 1
+                }
+                r = requests.get(MODIV_API, params=params, timeout=10)
+                if r.status_code == 200 and r.json():
+                              rec = r.json()[0]
+                              street = rec.get('property_location', '').strip()
+                              city = rec.get('property_city', '').strip().title()
+                              zipcode = rec.get('zip_code', '').strip()[:5]
+                              if street:
+                                                return {'address': street, 'city': city, 'zip': zipcode}
+      except Exception as e:
+                print(f'  Address lookup error (block/lot): {e}')
             return None
 
-        params = {
-            '$where': f"county_code='{cc}' AND block='{block.zfill(5)}' AND lot='{lot.zfill(4)}'",
-            '$limit': 1
-        }
-        r = requests.get(MODIV_API, params=params, timeout=10)
-        if r.status_code == 200 and r.json():
-            rec = r.json()[0]
-            street   = rec.get('property_location', '').strip()
-            city     = rec.get('property_city',     '').strip().title()
-            zip_code = rec.get('zip_code',          '').strip()[:5]
-            if street:
-                return {'address': street, 'city': city, 'zip': zip_code}
-    except Exception as e:
-        print(f'  Address lookup error (block/lot): {e}')
-    return None
 
-
-def lookup_address_by_name(county, last_name, municipality):
-    """Fallback: search MOD-IV by owner name + municipality."""
+def lookup_address_by_name(last_name, municipality):
+      """Fallback: search MOD-IV by owner name + municipality in Essex."""
     try:
-        params = {
-            '$where': (f"county_code='{_county_code(county)}' "
-                       f"AND upper(property_owner) LIKE '%{last_name.upper()}%' "
-                       f"AND upper(municipality_name) LIKE '%{municipality.upper()}%'"),
-            '$limit': 1
-        }
-        r = requests.get(MODIV_API, params=params, timeout=10)
-        if r.status_code == 200 and r.json():
-            rec = r.json()[0]
-            street   = rec.get('property_location', '').strip()
-            city     = rec.get('property_city',     '').strip().title()
-            zip_code = rec.get('zip_code',          '').strip()[:5]
-            if street:
-                return {'address': street, 'city': city, 'zip': zip_code}
+              params = {
+                            '$where': (
+                                              f"county_code='07' "
+                                              f"AND upper(property_owner) LIKE '%{last_name.upper()}%' "
+                                              f"AND upper(municipality_name) LIKE '%{municipality.upper()}%'"
+                            ),
+                            '$limit': 1
+              }
+              r = requests.get(MODIV_API, params=params, timeout=10)
+              if r.status_code == 200 and r.json():
+                            rec = r.json()[0]
+                            street = rec.get('property_location', '').strip()
+                            city = rec.get('property_city', '').strip().title()
+                            zipcode = rec.get('zip_code', '').strip()[:5]
+                            if street:
+                                              return {'address': street, 'city': city, 'zip': zipcode}
     except Exception as e:
         print(f'  Address lookup error (name): {e}')
     return None
 
 
-def _county_code(county):
-    m = {'Atlantic':'01','Bergen':'02','Burlington':'03','Camden':'04',
-         'Cape May':'05','Cumberland':'06','Essex':'07','Gloucester':'08',
-         'Hudson':'09','Hunterdon':'10','Mercer':'11','Middlesex':'12',
-         'Monmouth':'13','Morris':'14','Ocean':'15','Passaic':'16',
-         'Salem':'17','Somerset':'18','Sussex':'19','Union':'20','Warren':'21'}
-    return m.get(county, '07')
+def enrich_address(record):
+      """Fill in address/zip using block/lot or name fallback."""
+    block = record.get('block', '').strip()
+    lot = record.get('lot', '').strip()
+    city = record.get('city', '').strip()
+    name = record.get('name', '').strip()
+
+    if block and lot and block != 'N/A' and lot != 'N/A':
+              result = lookup_address_by_block_lot(block, lot)
+              if result:
+                            record['address'] = result['address']
+                            record['city'] = result.get('city') or city
+                            record['zip'] = result['zip']
+                            print(f"  Found address via block/lot: {result['address']}, {result['city']}")
+                            return record
+
+          if name and city:
+                    last_name = name.split()[-1] if name.split() else name
+                    result = lookup_address_by_name(last_name, city)
+                    if result:
+                                  record['address'] = result['address']
+                                  record['city'] = result.get('city') or city
+                                  record['zip'] = result['zip']
+                                  print(f"  Found address via name: {result['address']}, {result['city']}")
+                                  return record
+
+                print(f'  No address found for {name} in {city}')
+    return record
 
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-#  Essex County PRESS scraper (primary - confirmed working)
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+# ── Essex County PRESS scraper ──
 
 def scrape_essex(page, from_date_str, to_date_str):
-    """
-    Scrapes Essex County PRESS for LIS PENDENS FORECLOSURE filings.
-    Returns list of dicts: {name, city, block, lot, date, lender, instrument_number, county}
-    """
+      """
+          Scrape Essex County PRESS for lis pendens foreclosure filings.
+              Returns list of dicts with filing data.
+                  """
     records = []
     url = 'https://press.essexregister.com/prodpress/clerk/ClerkHome.aspx?op=basic'
-    print(f'  Navigating to Essex PRESS...', flush=True)
+    print(f'Navigating to Essex PRESS...')
     page.goto(url, wait_until='domcontentloaded')
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(3000)
 
     # Dismiss disclaimer if present
     try:
-        close_btn = page.query_selector('input[value="Close"], button:has-text("Close")')
-        if close_btn:
-            close_btn.click()
-            page.wait_for_timeout(500)
+              close_btn = page.query_selector('input[value="Close"], button:has-text("Close")')
+              if close_btn:
+                            close_btn.click()
+                            page.wait_for_timeout(500)
     except Exception:
         pass
 
@@ -216,109 +121,102 @@ def scrape_essex(page, from_date_str, to_date_str):
     page.click('text=By Document Type')
     page.wait_for_timeout(500)
 
-    # Select document type: LIS PENDENS FORECLOSURE (value=23)
-    page.select_option('#ctl00_ContentPlaceHolder1_ddlDocTypeTab2', '23')
-    page.wait_for_timeout(300)
-
-    # Set date range
-    page.fill('#ctl00_ContentPlaceHolder1_txtFromTab2', from_date_str)
-    page.fill('#ctl00_ContentPlaceHolder1_txtToTab2',   to_date_str)
-
-    # Also grab LIS PENDENS IN REM (value=21) and LIS PENDENS RECOVERY (value=24)
-    # by running separate searches - start with FORECLOSURE (23)
+    # Search each lis pendens doc type
     doc_types = [
-        ('23', 'LIS PENDENS FORECLOSURE'),
+              ('23', 'LIS PENDENS FORECLOSURE'),
+              ('21', 'LIS PENDENS IN REM'),
+              ('24', 'LIS PENDENS RECOVERY'),
+              ('25', 'LIS PENDENS FORECLOSURE AND RECOVERY'),
     ]
 
     for doc_val, doc_label in doc_types:
-        page.select_option('#ctl00_ContentPlaceHolder1_ddlDocTypeTab2', doc_val)
-        page.wait_for_timeout(300)
-        page.fill('#ctl00_ContentPlaceHolder1_txtFromTab2', from_date_str)
-        page.fill('#ctl00_ContentPlaceHolder1_txtToTab2',   to_date_str)
+              print(f'\n  Searching: {doc_label}...')
+              page.select_option('#ctl00_ContentPlaceHolder1_ddlDocTypeTab2', doc_val)
+              page.wait_for_timeout(300)
+              page.fill('#ctl00_ContentPlaceHolder1_txtFromTab2', from_date_str)
+              page.fill('#ctl00_ContentPlaceHolder1_txtToTab2', to_date_str)
 
-        # Hit search
         page.click('#ctl00_ContentPlaceHolder1_btnSearchTab2')
         page.wait_for_timeout(3000)
 
-        # Check for results
         body = page.inner_text('body')
         if 'No records' in body or 'returned 0' in body.lower():
-            print(f'    Essex {doc_label}: 0 results', flush=True)
-            page.go_back()
-            page.wait_for_timeout(1000)
-            page.click('text=By Document Type')
+                      print(f'    {doc_label}: 0 results')
+                      page.goto(url, wait_until='domcontentloaded')
+                      page.wait_for_timeout(1500)
+                      try:
+                                        close_btn = page.query_selector('input[value="Close"], button:has-text("Close")')
+                                        if close_btn:
+                                                              close_btn.click()
+                                                              page.wait_for_timeout(300)
+                      except Exception:
+                                        pass
+                                    page.click('text=By Document Type')
             page.wait_for_timeout(500)
             continue
 
-        # Paginate through all result pages
+        # Paginate through results
         page_num = 1
         while True:
-            # Precise selectors Ã¢ÂÂ only real lis pendens data rows
-            rows = page.query_selector_all('tr.itemstyle, tr.altitemstyle')
-
-            print(f'    Essex {doc_label} page {page_num}: {len(rows)} rows')
+                      all_rows = page.query_selector_all('table tr')
+            rows = [r for r in all_rows if r.query_selector('td')]
+            print(f'    Page {page_num}: {len(rows)} rows')
 
             for row in rows:
-                try:
-                    cells = row.query_selector_all('td')
-                    texts = [c.inner_text().strip() for c in cells]
-                    if len(texts) < 6: continue
-                    if 'LIS PENDENS FORECLOSURE' not in texts[0].upper(): continue
-                    if not re.match(r'^\d{10}$', texts[3] if len(texts) > 3 else ''): continue
+                              try:
+                                                    cells = row.query_selector_all('td')
+                                                    if len(cells) < 4:
+                                                                              continue
+                                                                          texts = [c.inner_text().strip() for c in cells]
 
-                    # Column order from PRESS: Type | Direct Party | Indirect Party |
-                    #                          Instrument# | Recorded | Town | Block | Lot | Book | Page | VIEW
-                    doc_type_cell   = texts[0] if len(texts) > 0 else ''
-                    direct_party    = texts[1] if len(texts) > 1 else ''
-                    indirect_party  = texts[2] if len(texts) > 2 else ''
-                    instrument_num  = texts[3] if len(texts) > 3 else ''
-                    recorded_date   = texts[4] if len(texts) > 4 else ''
-                    town            = texts[5] if len(texts) > 5 else ''
-                    block           = texts[6] if len(texts) > 6 else ''
-                    lot             = texts[7] if len(texts) > 7 else ''
+                                  direct_party = texts[1] if len(texts) > 1 else ''
+                    indirect_party = texts[2] if len(texts) > 2 else ''
+                    instrument_num = texts[3] if len(texts) > 3 else ''
+                    recorded_date = texts[4] if len(texts) > 4 else ''
+                    town = texts[5] if len(texts) > 5 else ''
+                    block = texts[6] if len(texts) > 6 else ''
+                    lot = texts[7] if len(texts) > 7 else ''
 
                     if not direct_party or not recorded_date:
-                        continue
-
-                    # Skip header rows
-                    if 'direct party' in direct_party.lower():
-                        continue
+                                              continue
+                                          if 'direct party' in direct_party.lower():
+                                                                    continue
 
                     records.append({
-                        'county':            'Essex',
-                        'name':              direct_party.title(),
-                        'lender':            indirect_party,
-                        'instrument_number': instrument_num,
-                        'date':              recorded_date,
-                        'city':              town.title(),
-                        'block':             block.replace('N/A', '').strip(),
-                        'lot':               lot.replace('N/A', '').strip(),
-                        'address':           '',   # filled in by address lookup
-                        'zip':               '',
-                        'state':             'NJ',
-                        'doc_type':          doc_label,
+                                              'name': direct_party.title(),
+                                              'lender': indirect_party,
+                                              'instrument_number': instrument_num,
+                                              'filing_date': recorded_date,
+                                              'city': town.title(),
+                                              'block': block.replace('N/A', '').strip(),
+                                              'lot': lot.replace('N/A', '').strip(),
+                                              'address': '',
+                                              'state': 'NJ',
+                                              'zip': '',
+                                              'county': 'Essex',
+                                              'doc_type': doc_label,
                     })
-                except Exception as e:
-                    print(f'    Row parse error: {e}', flush=True)
+except Exception as e:
+                    print(f'    Row parse error: {e}')
 
-            # Check for next page link
+            # Check for next page
             next_link = page.query_selector('a:has-text("Next"), a[href*="page="]')
             if next_link:
-                next_link.click()
+                              next_link.click()
                 page.wait_for_timeout(2000)
                 page_num += 1
-            else:
+else:
                 break
 
         # Go back to search for next doc type
         page.goto(url, wait_until='domcontentloaded')
         page.wait_for_timeout(1500)
         try:
-            close_btn = page.query_selector('input[value="Close"], button:has-text("Close")')
+                      close_btn = page.query_selector('input[value="Close"], button:has-text("Close")')
             if close_btn:
-                close_btn.click()
+                              close_btn.click()
                 page.wait_for_timeout(300)
-        except Exception:
+except Exception:
             pass
         page.click('text=By Document Type')
         page.wait_for_timeout(500)
@@ -326,418 +224,82 @@ def scrape_essex(page, from_date_str, to_date_str):
     return records
 
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-#  Union County scraper
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+# ── Write results to CSV ──
 
-def scrape_union(page, from_date_str, to_date_str):
-    """Scrapes Union County public land records for lis pendens."""
-    records = []
-    url = 'https://clerk.ucnj.org/UCPA/DocIndex?s=type'
-    print(f'  Navigating to Union County PRESS...', flush=True)
-    try:
-        page.goto(url, wait_until='domcontentloaded', timeout=15000)
-        page.wait_for_timeout(2000)
-
-        # Select document type - look for lis pendens option
-        doc_select = page.query_selector('select[name*="type"], select[id*="type"], select')
-        if doc_select:
-            options = page.eval_on_selector(
-                'select', 'el => Array.from(el.options).map(o => ({v:o.value,t:o.text}))'
-            )
-            lp_option = next(
-                (o for o in options if 'lis pendens' in o['t'].lower()), None
-            )
-            if lp_option:
-                page.select_option('select', lp_option['v'])
-                page.wait_for_timeout(300)
-
-        # Set date fields
-        from_field = page.query_selector('input[name*="from"], input[id*="from"], input[placeholder*="from"]')
-        to_field   = page.query_selector('input[name*="to"],   input[id*="to"],   input[placeholder*="to"]')
-        if from_field: from_field.fill(from_date_str)
-        if to_field:   to_field.fill(to_date_str)
-
-        # Submit
-        page.click('input[type="submit"], button[type="submit"], button:has-text("Search")')
-        page.wait_for_timeout(3000)
-
-        rows = page.query_selector_all('table tr')
-        data_rows = [r for r in rows if r.query_selector('td')]
-        print(f'    Union: {len(data_rows)} rows')
-
-        for row in data_rows:
-            try:
-                cells = row.query_selector_all('td')
-                texts = [c.inner_text().strip() for c in cells]
-                if len(texts) < 3: continue
-                records.append({
-                    'county':            'Union',
-                    'name':              texts[1].title() if len(texts) > 1 else '',
-                    'lender':            texts[2] if len(texts) > 2 else '',
-                    'instrument_number': texts[0] if texts else '',
-                    'date':              texts[3] if len(texts) > 3 else '',
-                    'city':              texts[4].title() if len(texts) > 4 else '',
-                    'block':             '',
-                    'lot':               '',
-                    'address':           '',
-                    'zip':               '',
-                    'state':             'NJ',
-                    'doc_type':          'LIS PENDENS',
-                })
-            except Exception as e:
-                print(f'    Union row error: {e}', flush=True)
-    except Exception as e:
-        print(f'  Union scrape failed: {e}', flush=True)
-
-    return records
-
-
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-#  Passaic County scraper  
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-
-def scrape_passaic(page, from_date_str, to_date_str):
-    """Scrapes Passaic County land records for lis pendens."""
-    records = []
-    # Passaic uses a different system - try their online portal
-    urls_to_try = [
-        'https://passaiccountyclerk.com/LandRecords/',
-        'https://clerk.co.passaic.nj.us/',
-    ]
-    for url in urls_to_try:
-        try:
-            print(f'  Trying Passaic at {url}...', flush=True)
-            page.goto(url, wait_until='domcontentloaded', timeout=10000)
-            page.wait_for_timeout(2000)
-            title = page.title()
-            print(f'    Page title: {title}', flush=True)
-            # If we get a search form, attempt to use it
-            search_input = page.query_selector('input[type="text"]')
-            if search_input:
-                print('    Passaic has search form - attempting lis pendens search', flush=True)
-                # Implementation depends on their specific UI
-                # For now log and skip - Passaic is mostly in-person
-                break
-        except Exception as e:
-            print(f'    Passaic URL failed: {e}', flush=True)
-    
-    print('  Passaic County: online portal not reliably scrapeable - skipping (in-person only)')
-    return records
-
-
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-#  Address enrichment
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-
-def enrich_address(record):
-    """
-    Attempts to fill record['address'] and record['zip'] using:
-    1. Block/Lot ÃÂ¢ÃÂÃÂ MOD-IV lookup
-    2. Name + city ÃÂ¢ÃÂÃÂ MOD-IV lookup (fallback)
-    Returns the record (mutated in place).
-    """
-    county = record.get('county', 'Essex')
-    block  = record.get('block', '').strip()
-    lot    = record.get('lot', '').strip()
-    city   = record.get('city', '').strip()
-    name   = record.get('name', '').strip()
-
-    # Try block/lot first
-    if block and lot and block != 'N/A' and lot != 'N/A':
-        result = lookup_address_by_block_lot(county, block, lot)
-        if result:
-            record['address'] = result['address']
-            record['city']    = result['city'] or city
-            record['zip']     = result['zip']
-            print(f'    Address via block/lot: {result["address"]}, {result["city"]} {result["zip"]}', flush=True)
-            return record
-
-    # Fallback: use last name + city
-    if name and city:
-        last_name = name.split()[-1] if name.split() else name
-        result = lookup_address_by_name(county, last_name, city)
-        if result:
-            record['address'] = result['address']
-            record['city']    = result['city'] or city
-            record['zip']     = result['zip']
-            print(f'    Address via name lookup: {result["address"]}, {result["city"]} {result["zip"]}', flush=True)
-            return record
-
-    # No address found - leave blank (ReSimpli will skip-trace it)
-    print(f'    No address found for {name} in {city} - will skip trace', flush=True)
-    return record
-
-
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-#  ReSimpli integration (enhanced from original)
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-
-def create_lead(prop):
-    """Creates a lead in ReSimpli with full name + address data."""
-    name_parts = prop.get('name', 'Unknown Owner').split()
-    first = name_parts[0] if name_parts else 'Unknown'
-    last  = ' '.join(name_parts[1:]) if len(name_parts) > 1 else 'Owner'
-
-    payload = {
-        'title':          f"{first} {last}",
-        'address':        prop.get('address', ''),
-        'city':           prop.get('city', ''),
-        'state':          'NJ',
-        'zip':            prop.get('zip', ''),
-        'crmQuestionId':  '5a2e0dca067911531aa76288',
-        'marketId':       '69bb084f8cbe02c74aa612e2',
-        'phoneNumber':    '',
-        'email':          '',
-        'secondaryContact': [],
-        'latitude':       '',
-        'longitude':      '',
-        'ownerName1':     f"{first} {last}",
-        'ownerMailingAddress': prop.get('address', ''),
-        'notes': (
-            f"County: {prop.get('county')} | "
-            f"Instrument: {prop.get('instrument_number')} | "
-            f"Filed: {prop.get('date')} | "
-            f"Lender: {prop.get('lender')} | "
-            f"Type: {prop.get('doc_type')} | "
-            f"Score: {prop.get('score')}"
-        )
-    }
-
-    r = requests.post(
-        f'{RESIMPLI_BASE}/lead/save',
-        headers=RESIMPLI_HEADERS,
-        json=payload
-    )
-    if r.status_code == 200:
-        data = r.json()
-        lead_id = data.get('data', {}).get('_id') or data.get('_id')
-        print(f'    Lead created: {lead_id} | {first} {last}', flush=True)
-        return lead_id
-    print(f'    Lead create failed: {r.status_code} {r.text[:200]}', flush=True)
-    return None
-
-
-def skip_trace(lead_id):
-    r = requests.post(
-        f'{RESIMPLI_BASE}/lead/leadSkipTrace',
-        headers=RESIMPLI_HEADERS,
-        json={'leadId': lead_id}
-    )
-    if r.status_code != 200:
-        print(f'    Skip trace failed: {r.status_code} {r.text[:200]}', flush=True)
-    else:
-        print(f'    Skip traced: {lead_id}', flush=True)
-
-
-def enroll_drip(lead_id, score):
-    if score >= 80:
-        drip_id = DRIP_HOT
-        label   = 'HOT'
-    elif score >= 65:
-        drip_id = DRIP_WARM
-        label   = 'WARM'
-    elif score >= 45:
-        drip_id = DRIP_COLD
-        label   = 'COLD'
-    else:
-        print(f'    Score {score} below drip threshold - not enrolled', flush=True)
+def write_csv(records, filename):
+      """Write records to a CSV file."""
+    if not records:
+              print('No records to write.')
         return
 
-    r = requests.post(
-        f'{RESIMPLI_BASE}/masterDrip/assignToLead',
-        headers=RESIMPLI_HEADERS,
-        json={'leadId': lead_id, 'masterDripId': drip_id}
-    )
-    if r.status_code != 200:
-        print(f'    Drip enroll failed: {r.status_code} {r.text[:200]}', flush=True)
-    else:
-        print(f'    Enrolled in {label} drip', flush=True)
+    fieldnames = [
+              'name', 'address', 'city', 'state', 'zip', 'county',
+              'filing_date', 'lender', 'instrument_number', 'doc_type',
+              'block', 'lot'
+    ]
+
+    with open(filename, 'w', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(records)
+
+    print(f'\nWrote {len(records)} records to {filename}')
 
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-#  Seen properties cache
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+# ── Main ──
 
-def load_seen():
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE) as f:
-            return set(json.load(f))
-    return set()
+def main():
+      print(f'\n=== NJ Foreclosure Bot (Essex County) ===')
+    print(f'Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}')
+    print(f'Lookback: {LOOKBACK_DAYS} day(s)')
+    print('=' * 45)
 
-
-def save_seen(seen):
-    with open(SEEN_FILE, 'w') as f:
-        json.dump(list(seen), f)
-
-
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-#  Main scrape orchestrator
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-
-def scrape_all():
-    """Run all county scrapers and return combined, enriched property list."""
-    all_records = []
-
-    today     = datetime.now()
+    today = datetime.now()
     from_date = today - timedelta(days=LOOKBACK_DAYS)
-    from_str  = from_date.strftime('%m/%d/%Y')
-    to_str    = today.strftime('%m/%d/%Y')
-
-    print(f'Date range: {from_str} ÃÂ¢ÃÂÃÂ {to_str}', flush=True)
+    from_str = from_date.strftime('%m/%d/%Y')
+    to_str = today.strftime('%m/%d/%Y')
+    print(f'Date range: {from_str} to {to_str}\n')
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-            ]
-        )
+              browser = pw.chromium.launch(
+                            headless=True,
+                            args=['--no-sandbox', '--disable-setuid-sandbox',
+                                                    '--disable-dev-shm-usage']
+              )
         ctx = browser.new_context(
-            user_agent=(
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
-            )
+                      user_agent=(
+                                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                        'Chrome/120.0.0.0 Safari/537.36'
+                      )
         )
         page = ctx.new_page()
 
-        # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Essex ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-        print('\n=== Scraping Essex County ===', flush=True)
-        try:
-            essex_records = scrape_essex(page, from_str, to_str)
-            print(f'  Essex raw records: {len(essex_records)}')
-            all_records.extend(essex_records)
-        except Exception as e:
-            print(f'  Essex scrape error: {e}', flush=True)
-
-        # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Union ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-        print('\n=== Scraping Union County ===', flush=True)
-        try:
-            union_records = scrape_union(page, from_str, to_str)
-            print(f'  Union raw records: {len(union_records)}')
-            all_records.extend(union_records)
-        except Exception as e:
-            print(f'  Union scrape error: {e}', flush=True)
-
-        # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Passaic ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-        print('\n=== Scraping Passaic County ===', flush=True)
-        try:
-            passaic_records = scrape_passaic(page, from_str, to_str)
-            print(f'  Passaic raw records: {len(passaic_records)}')
-            all_records.extend(passaic_records)
-        except Exception as e:
-            print(f'  Passaic scrape error: {e}', flush=True)
-
+        records = scrape_essex(page, from_str, to_str)
         browser.close()
 
+    print(f'\nScraped {len(records)} raw records')
+
     # Deduplicate by instrument number
-    seen_instruments = set()
-    unique_records = []
-    for r in all_records:
-        key = r.get('instrument_number') or f"{r['county']}-{r['name']}-{r['date']}"
-        if key not in seen_instruments:
-            seen_instruments.add(key)
-            unique_records.append(r)
+    seen = set()
+    unique = []
+    for r in records:
+              key = r.get('instrument_number') or f"{r['name']}-{r['filing_date']}"
+        if key not in seen:
+                      seen.add(key)
+            unique.append(r)
+    print(f'Unique records: {len(unique)}')
 
-    print(f'\nTotal unique records: {len(unique_records)}')
+    # Enrich with addresses from MOD-IV
+    print('\nLooking up addresses via NJ MOD-IV tax data...')
+    for rec in unique:
+              enrich_address(rec)
+        time.sleep(0.3)  # be polite to the API
 
-    # Enrich with addresses
-    print('\nEnriching addresses via NJ MOD-IV...', flush=True)
-    for rec in unique_records:
-        enrich_address(rec)
-
-    # Compute scores
-    for rec in unique_records:
-        try:
-            filed_date = datetime.strptime(rec['date'], '%m/%d/%Y')
-            days_old   = (datetime.now() - filed_date).days
-        except Exception:
-            days_old = 0
-
-        rec['days_old'] = days_old
-        rec['score']    = kps_score(0, 0, days_old, rec.get('city', ''))
-
-    return unique_records
-
-
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-#  Main loop
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-
-def main():
-    print(f'\nNJ Foreclosure Bot v2 ÃÂ¢ÃÂÃÂ {datetime.now()}')
-    print(f'TEST_MODE={TEST_MODE} | LOOKBACK_DAYS={LOOKBACK_DAYS}', flush=True)
-    print('Source: Essex/Union/Passaic County PRESS portals (direct)')
-    print('ÃÂ¢ÃÂÃÂ' * 60, flush=True)
-
-    seen = set() if TEST_MODE else load_seen()
-    print(f'Seen cache: {len(seen)} instruments\n')
-
-    records = scrape_all()
-    print(f'\nScraped {len(records)} total records')
-
-    new_records = [r for r in records if
-                   (r.get('instrument_number') or
-                    f"{r['county']}-{r['name']}-{r['date']}") not in seen]
-    print(f'New records to process: {len(new_records)}')
-
-    if not new_records:
-        print('Nothing new to process.', flush=True)
-        return
-
-    for prop in new_records:
-        key   = prop.get('instrument_number') or f"{prop['county']}-{prop['name']}-{prop['date']}"
-        score = prop['score']
-
-        print(f'\nProcessing: {prop["name"]} | {prop.get("address","(no addr)")} '
-              f'{prop["city"]}, NJ {prop.get("zip","")} | '
-              f'{prop["county"]} | Filed: {prop["date"]} | Score: {score}')
-
-        if score < 25:
-            print(f'  SKIP - score {score} below minimum threshold', flush=True)
-            seen.add(key)
-            continue
-
-        if TEST_MODE:
-            print(f'  TEST MODE - would create lead + skip trace + enroll drip', flush=True)
-            print(f'  Full record: {json.dumps(prop, indent=2)}')
-            seen.add(key)
-            continue
-
-        lead_id = create_lead(prop)
-        if not lead_id:
-            print(f'  Failed to create lead - skipping', flush=True)
-            continue
-
-        skip_trace(lead_id)
-        enroll_drip(lead_id, score)
-        seen.add(key)
-
-    if not TEST_MODE:
-        save_seen(seen)
-
-    print(f'\nDone. Processed {len(new_records)} records.')
+    # Write to CSV
+    write_csv(unique, OUTPUT_CSV)
+    print('\nDone!')
 
 
 if __name__ == '__main__':
-    if TEST_MODE:
-        try:
-            main()
-        except Exception as e:
-            print(f'Error in test run: {e}', flush=True)
-            import traceback; traceback.print_exc()
-            import sys; sys.exit(0)
-    else:
-        while True:
-            try:
-                main()
-            except Exception as e:
-                print(f'Error in main loop: {e}', flush=True)
-                import traceback; traceback.print_exc()
-            print('\nSleeping 24 hours...', flush=True)
-            time.sleep(86400)
+      main()
