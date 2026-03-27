@@ -1,8 +1,8 @@
-"""
-NJ Foreclosure Bot - Essex County
+""" NJ Foreclosure Bot - Essex County
 Scrapes Essex County PRESS for lis pendens foreclosure filings,
 looks up addresses via NJ MOD-IV tax data, outputs to CSV.
 """
+
 import csv
 import os
 import re
@@ -13,14 +13,14 @@ from playwright.sync_api import sync_playwright
 
 # ── Config ──
 LOOKBACK_DAYS = int(os.environ.get('LOOKBACK_DAYS', '30'))
-OUTPUT_CSV = os.environ.get('OUTPUT_CSV', 'essex_foreclosures.csv')
-MODIV_API = 'https://data.nj.gov/resource/9qqx-mnbd.json'
+OUTPUT_CSV    = os.environ.get('OUTPUT_CSV', 'essex_foreclosures.csv')
+MODIV_API     = 'https://data.nj.gov/resource/9qqx-mnbd.json'
 
 JUNK_PATTERNS = [
     'direct party', 'indirect party', 'instrument #', 'recorded',
-    'town name', 'register of deeds', 'property records', 'terms of use',
-    'site compatible', 'records search', 'rel 20', 'sunrise',
-    'type', 'search results', 'no records', 'page of',
+    'town name', 'register of deeds', 'property records',
+    'terms of use', 'site compatible', 'records search',
+    'rel 20', 'sunrise', 'search results', 'no records', 'page of',
 ]
 
 def is_junk_row(text):
@@ -33,8 +33,7 @@ def is_junk_row(text):
     return False
 
 def is_valid_date(s):
-    import re as _re
-    return bool(_re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', s.strip()))
+    return bool(re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', s.strip()))
 
 def lookup_address_by_block_lot(block, lot):
     try:
@@ -47,8 +46,8 @@ def lookup_address_by_block_lot(block, lot):
         r = requests.get(MODIV_API, params=params, timeout=10)
         if r.status_code == 200 and r.json():
             rec = r.json()[0]
-            street = rec.get('property_location', '').strip()
-            city = rec.get('property_city', '').strip().title()
+            street  = rec.get('property_location', '').strip()
+            city    = rec.get('property_city', '').strip().title()
             zipcode = rec.get('zip_code', '').strip()[:5]
             if street:
                 return {'address': street, 'city': city, 'zip': zipcode}
@@ -69,8 +68,8 @@ def lookup_address_by_name(last_name, municipality):
         r = requests.get(MODIV_API, params=params, timeout=10)
         if r.status_code == 200 and r.json():
             rec = r.json()[0]
-            street = rec.get('property_location', '').strip()
-            city = rec.get('property_city', '').strip().title()
+            street  = rec.get('property_location', '').strip()
+            city    = rec.get('property_city', '').strip().title()
             zipcode = rec.get('zip_code', '').strip()[:5]
             if street:
                 return {'address': street, 'city': city, 'zip': zipcode}
@@ -80,29 +79,30 @@ def lookup_address_by_name(last_name, municipality):
 
 def enrich_address(record):
     block = record.get('block', '').strip()
-    lot = record.get('lot', '').strip()
-    city = record.get('city', '').strip()
-    name = record.get('name', '').strip()
+    lot   = record.get('lot',   '').strip()
+    city  = record.get('city',  '').strip()
+    name  = record.get('name',  '').strip()
     if block and lot and block != 'N/A' and lot != 'N/A':
         result = lookup_address_by_block_lot(block, lot)
         if result:
             record['address'] = result['address']
-            record['city'] = result.get('city') or city
-            record['zip'] = result['zip']
+            record['city']    = result.get('city') or city
+            record['zip']     = result['zip']
             return record
     if name and city:
         last_name = name.split()[-1] if name.split() else name
         result = lookup_address_by_name(last_name, city)
         if result:
             record['address'] = result['address']
-            record['city'] = result.get('city') or city
-            record['zip'] = result['zip']
+            record['city']    = result.get('city') or city
+            record['zip']     = result['zip']
     return record
 
 def reset_to_search(page, url):
     page.goto(url, wait_until='domcontentloaded')
     page.wait_for_timeout(2000)
-    for sel in ['input[value="Close"]', 'button:has-text("Close")', 'input[value="I Agree"]', 'button:has-text("I Agree")']:
+    for sel in ['input[value="Close"]', 'button:has-text("Close")',
+                'input[value="I Agree"]', 'button:has-text("I Agree")']:
         try:
             btn = page.query_selector(sel)
             if btn and btn.is_visible():
@@ -116,6 +116,78 @@ def reset_to_search(page, url):
         page.wait_for_timeout(500)
     except Exception:
         pass
+
+def parse_row(texts, row_num, page_num):
+    """
+    Essex PRESS table columns (0-indexed):
+      0: row number
+      1: doc type code
+      2: direct party (borrower)
+      3: indirect party (lender)
+      4: instrument number
+      5: recorded date  (MM/DD/YYYY)
+      6: town name
+      7: block
+      8: lot
+    Try date-based detection first, fall back to fixed indices.
+    """
+    if len(texts) < 6:
+        return None
+
+    # --- method 1: find date column by pattern ---
+    date_col = None
+    for i, t in enumerate(texts):
+        if is_valid_date(t):
+            date_col = i
+            break
+
+    # --- method 2: fixed column layout (col 5 = date) ---
+    if date_col is None:
+        if len(texts) >= 9 and is_valid_date(texts[5]):
+            date_col = 5
+        elif len(texts) >= 7 and is_valid_date(texts[4]):
+            date_col = 4
+
+    # Diagnostic for first 3 rows on page 1
+    if page_num == 1 and row_num < 3:
+        print(f'  [diag] row{row_num} cols={len(texts)} date_col={date_col} texts={texts[:9]}')
+
+    if date_col is None:
+        return None
+
+    # Need at least 3 cols before date (direct, indirect, instr)
+    # and at least 1 col after (town)
+    if date_col < 3 or date_col + 1 >= len(texts):
+        return None
+
+    recorded_date  = texts[date_col].strip()
+    direct_party   = texts[date_col - 3].strip()
+    indirect_party = texts[date_col - 2].strip()
+    instrument_num = texts[date_col - 1].strip()
+    town           = texts[date_col + 1].strip() if len(texts) > date_col + 1 else ''
+    block          = texts[date_col + 2].strip() if len(texts) > date_col + 2 else ''
+    lot            = texts[date_col + 3].strip() if len(texts) > date_col + 3 else ''
+
+    if is_junk_row(direct_party):
+        return None
+    if not direct_party or len(direct_party) < 2:
+        return None
+    if re.match(r'^[\d\s]+$', direct_party):
+        return None
+
+    return {
+        'name':              direct_party.title(),
+        'lender':            indirect_party.title(),
+        'instrument_number': instrument_num,
+        'filing_date':       recorded_date,
+        'city':              town.title(),
+        'block':             block.replace('N/A', '').strip(),
+        'lot':               lot.replace('N/A', '').strip(),
+        'address':           '',
+        'state':             'NJ',
+        'zip':               '',
+        'county':            'Essex',
+    }
 
 def scrape_essex(page, from_date_str, to_date_str):
     records = []
@@ -136,7 +208,7 @@ def scrape_essex(page, from_date_str, to_date_str):
             page.select_option('#ctl00_ContentPlaceHolder1_ddlDocTypeTab2', doc_val)
             page.wait_for_timeout(300)
             page.fill('#ctl00_ContentPlaceHolder1_txtFromTab2', from_date_str)
-            page.fill('#ctl00_ContentPlaceHolder1_txtToTab2', to_date_str)
+            page.fill('#ctl00_ContentPlaceHolder1_txtToTab2',   to_date_str)
             page.click('#ctl00_ContentPlaceHolder1_btnSearchTab2')
             page.wait_for_timeout(4000)
         except Exception as e:
@@ -152,58 +224,25 @@ def scrape_essex(page, from_date_str, to_date_str):
 
         page_num = 1
         consecutive_empty = 0
+
         while True:
             page.wait_for_timeout(1500)
             all_rows = page.query_selector_all('table tr')
-            rows = [r for r in all_rows if r.query_selector('td')]
+            rows     = [r for r in all_rows if r.query_selector('td')]
             print(f'  Page {page_num}: {len(rows)} candidate rows')
 
             page_records = 0
-            for row in rows:
+            for row_num, row in enumerate(rows):
                 try:
                     cells = row.query_selector_all('td')
                     if len(cells) < 5:
                         continue
                     texts = [c.inner_text().strip() for c in cells]
-
-                    date_col = None
-                    for i, t in enumerate(texts):
-                        if is_valid_date(t):
-                            date_col = i
-                            break
-                    if date_col is None or date_col < 3:
-                        continue
-
-                    recorded_date  = texts[date_col]
-                    direct_party   = texts[date_col - 3].strip()
-                    indirect_party = texts[date_col - 2].strip()
-                    instrument_num = texts[date_col - 1].strip()
-                    town  = texts[date_col + 1].strip() if len(texts) > date_col + 1 else ''
-                    block = texts[date_col + 2].strip() if len(texts) > date_col + 2 else ''
-                    lot   = texts[date_col + 3].strip() if len(texts) > date_col + 3 else ''
-
-                    if is_junk_row(direct_party):
-                        continue
-                    if not direct_party or len(direct_party) < 2:
-                        continue
-                    if re.match(r'^[\d\s]+$', direct_party):
-                        continue
-
-                    records.append({
-                        'name': direct_party.title(),
-                        'lender': indirect_party.title(),
-                        'instrument_number': instrument_num,
-                        'filing_date': recorded_date,
-                        'city': town.title(),
-                        'block': block.replace('N/A', '').strip(),
-                        'lot': lot.replace('N/A', '').strip(),
-                        'address': '',
-                        'state': 'NJ',
-                        'zip': '',
-                        'county': 'Essex',
-                        'doc_type': doc_label,
-                    })
-                    page_records += 1
+                    rec = parse_row(texts, row_num, page_num)
+                    if rec:
+                        rec['doc_type'] = doc_label
+                        records.append(rec)
+                        page_records += 1
                 except Exception as e:
                     print(f'  Row parse error: {e}')
 
@@ -217,7 +256,8 @@ def scrape_essex(page, from_date_str, to_date_str):
                 consecutive_empty = 0
 
             next_link = None
-            for sel in ['a:has-text("Next")', 'a:has-text(">>")', 'a:has-text(">")', 'input[value="Next"]', 'input[value=">"]']:
+            for sel in ['a:has-text("Next")', 'a:has-text(">>")',
+                        'a:has-text(">")', 'input[value="Next"]', 'input[value=">"]']:
                 try:
                     el = page.query_selector(sel)
                     if el and el.is_visible():
@@ -246,7 +286,8 @@ def write_csv(records, filename):
     if not records:
         print('No records to write.')
         return
-    fieldnames = ['name', 'address', 'city', 'state', 'zip', 'county', 'filing_date', 'lender', 'instrument_number', 'doc_type', 'block', 'lot']
+    fieldnames = ['name', 'address', 'city', 'state', 'zip', 'county',
+                  'filing_date', 'lender', 'instrument_number', 'doc_type', 'block', 'lot']
     with open(filename, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -258,21 +299,29 @@ def main():
     print(f'Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}')
     print(f'Lookback: {LOOKBACK_DAYS} day(s)')
     print('=' * 45)
-    today = datetime.now()
+
+    today     = datetime.now()
     from_date = today - timedelta(days=LOOKBACK_DAYS)
-    from_str = from_date.strftime('%m/%d/%Y')
-    to_str = today.strftime('%m/%d/%Y')
+    from_str  = from_date.strftime('%m/%d/%Y')
+    to_str    = today.strftime('%m/%d/%Y')
     print(f'Date range: {from_str} to {to_str}\n')
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'])
-        ctx = browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        page = ctx.new_page()
+        browser = pw.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        )
+        ctx  = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/120.0.0.0 Safari/537.36'
+        )
+        page    = ctx.new_page()
         records = scrape_essex(page, from_str, to_str)
         browser.close()
 
     print(f'\nScraped {len(records)} raw records')
-    seen = set()
+    seen   = set()
     unique = []
     for r in records:
         key = r.get('instrument_number') or f"{r['name']}-{r['filing_date']}"
