@@ -4,9 +4,9 @@ on:
   schedule:
     - cron: '0 8 * * *'
   workflow_dispatch:
-  permissions:
-    contents: write
-    
+
+permissions:
+  contents: write
 
 jobs:
   scrape:
@@ -39,4 +39,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add sample_essex_foreclosures.csv
           git diff --cached --quiet || git commit -m "Daily update: Essex County lis pendens $(date +'%Y-%m-%d')"
+          git pull --rebase
           git push
