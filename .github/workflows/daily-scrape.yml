@@ -2,45 +2,46 @@ name: Daily NJ Foreclosure Scrape
 
 on:
   schedule:
-    - cron: '0 8 * * *'
-  workflow_dispatch:
+      - cron: '0 8 * * *'
+        workflow_dispatch:
 
-permissions:
-  contents: write
+        permissions:
+          contents: write
 
-jobs:
-  scrape:
-    runs-on: ubuntu-latest
+          jobs:
+            scrape:
+                runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+                    steps:
+                          - name: Checkout repo
+                                  uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+                                        - name: Set up Python
+                                                uses: actions/setup-python@v5
+                                                        with:
+                                                                  python-version: '3.11'
 
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install chromium
-          playwright install-deps chromium
-
-      - name: Run scraper
-        run: python main.py
-        env:
-          LOOKBACK_DAYS: '28'
-          OUTPUT_CSV: 'sample_essex_foreclosures.csv'
-
-      - name: Commit and push updated CSV
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sample_essex_foreclosures.csv
-          git stash
-          git pull --rebase
-          git stash pop || true
-          git add sample_essex_foreclosures.csv
-          git diff --staged --quiet || git commit -m "Update foreclosure CSV [skip ci]"
-          git push
+                                                                        - name: Install dependencies
+                                                                                run: |
+                                                                                          pip install -r requirements.txt
+                                                                                                    playwright install chromium
+                                                                                                              playwright install-deps chromium
+                                                                                                              
+                                                                                                                    - name: Run scraper
+                                                                                                                            run: python main.py
+                                                                                                                                    env:
+                                                                                                                                              LOOKBACK_DAYS: '1'
+                                                                                                                                                        OUTPUT_CSV: 'sample_essex_foreclosures.csv'
+                                                                                                                                                                  GOOGLE_SHEET_ID: '1D8fNy-v6_iMi_5jl6IuTZlS6-6xPYEh9HgIGJCHJ0yg'
+                                                                                                                                                                            GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+                                                                                                                                                                            
+                                                                                                                                                                                  - name: Commit and push updated CSV
+                                                                                                                                                                                          run: |
+                                                                                                                                                                                                    git config user.name "github-actions[bot]"
+                                                                                                                                                                                                              git config user.email "github-actions[bot]@users.noreply.github.com"
+                                                                                                                                                                                                                        git stash
+                                                                                                                                                                                                                                  git pull --rebase
+                                                                                                                                                                                                                                            git stash pop || true
+                                                                                                                                                                                                                                                      git add sample_essex_foreclosures.csv
+                                                                                                                                                                                                                                                                git diff --staged --quiet || git commit -m "Update foreclosure CSV [skip ci]"
+                                                                                                                                                                                                                                                                          git push
