@@ -1,7 +1,6 @@
-"""
-NJ Foreclosure Bot - Essex County
+""" NJ Foreclosure Bot - Essex County
 Scrapes Essex County PRESS for lis pendens foreclosure filings,
-looks up addresses via NJ MOD-IV tax data,
+looks up property addresses via taxrecords-nj.com (NJ County Tax Board),
 outputs to CSV and uploads to Google Sheets.
 """
 import csv
@@ -10,16 +9,41 @@ import os
 import re
 import time
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from playwright.sync_api import sync_playwright
-
 import gspread
 from google.oauth2.service_account import Credentials
 
 LOOKBACK_DAYS = int(os.environ.get('LOOKBACK_DAYS', '30'))
 OUTPUT_CSV = os.environ.get('OUTPUT_CSV', 'essex_foreclosures.csv')
 SHEET_ID = os.environ.get('GOOGLE_SHEET_ID', '1D8fNy-v6_iMi_5jl6IuTZlS6-6xPYEh9HgIGJCHJ0yg')
-MODIV_API = 'https://data.nj.gov/resource/9qqx-mnbd.json'
+
+# Essex County district codes for taxrecords-nj.com
+ESSEX_DISTRICTS = {
+    'NEWARK': '0714',
+    'IRVINGTON': '0708',
+    'EAST ORANGE': '0705',
+    'ORANGE': '0715',
+    'WEST ORANGE': '0720',
+    'MONTCLAIR': '0711',
+    'BLOOMFIELD': '0702',
+    'BELLEVILLE': '0701',
+    'NUTLEY': '0716',
+    'MAPLEWOOD': '0710',
+    'SOUTH ORANGE': '0717',
+    'MILLBURN': '0712',
+    'LIVINGSTON': '0709',
+    'FAIRFIELD': '0706',
+    'NORTH CALDWELL': '0713',
+    'CALDWELL': '0703',
+    'WEST CALDWELL': '0719',
+    'CEDAR GROVE': '0704',
+    'VERONA': '0718',
+    'GLEN RIDGE': '0707',
+    'ROSELAND': '0736',
+    'ESSEX FELLS': '0737',
+}
 
 JUNK_PATTERNS = [
     'direct party', 'indirect party', 'instrument #', 'recorded',
@@ -43,67 +67,69 @@ def is_junk_row(text):
 def is_valid_date(s):
     return bool(re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', s.strip()))
 
-def lookup_address_by_block_lot(block, lot):
-    try:
-        if not block or block == 'N/A' or not lot or lot == 'N/A':
-            return None
-        params = {
-            '$where': f"county_code='07' AND block='{block.zfill(5)}' AND lot='{lot.zfill(4)}'",
-            '$limit': 1
-        }
-        r = requests.get(MODIV_API, params=params, timeout=10)
-        if r.status_code == 200 and r.json():
-            rec = r.json()[0]
-            street = rec.get('property_location', '').strip()
-            city = rec.get('property_city', '').strip().title()
-            zipcode = rec.get('zip_code', '').strip()[:5]
-            if street:
-                return {'address': street, 'city': city, 'zip': zipcode}
-    except Exception as e:
-        print(f'  Address lookup error (block/lot): {e}')
-    return None
+def lookup_address(name, city):
+    """Look up property address from NJ Tax Board records via taxrecords-nj.com."""
+    city_upper = city.upper().strip()
+    district = ESSEX_DISTRICTS.get(city_upper)
+    if not district:
+        # Try ALL Essex districts
+        district = '0799'
 
-def lookup_address_by_name(last_name, municipality):
+    # Extract last name (most reliable search term)
+    parts = name.strip().split()
+    if not parts:
+        return None
+    # Use first token as last name (PRESS format is LASTNAME FIRSTNAME)
+    last_name = parts[0].upper()
+    # Skip generic/junk names
+    if last_name in ('NEWARK,', 'CITY', 'STATE', 'LLC', 'INC', 'CORP', 'TRUST'):
+        return None
+
     try:
+        url = 'https://taxrecords-nj.com/pub/cgi/prc6.cgi'
         params = {
-            '$where': (
-                f"county_code='07' "
-                f"AND upper(property_owner) LIKE '%{last_name.upper()}%' "
-                f"AND upper(municipality_name) LIKE '%{municipality.upper()}%'"
-            ),
-            '$limit': 1
+            'district': district,
+            'ms_user': 'essex',
+            'owner': last_name,
+            'srch': '1',
+            'out': 'wb',
+            'list': '5',
         }
-        r = requests.get(MODIV_API, params=params, timeout=10)
-        if r.status_code == 200 and r.json():
-            rec = r.json()[0]
-            street = rec.get('property_location', '').strip()
-            city = rec.get('property_city', '').strip().title()
-            zipcode = rec.get('zip_code', '').strip()[:5]
-            if street:
-                return {'address': street, 'city': city, 'zip': zipcode}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            print(f'  Tax lookup HTTP {resp.status_code} for {name}')
+            return None
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        # Results table has columns: Block, Lot, Qual, Class, Location, Owner
+        tables = soup.find_all('table')
+        for table in tables:
+            rows = table.find_all('tr')
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) >= 6:
+                    location = cells[4].get_text(strip=True)
+                    owner = cells[5].get_text(strip=True)
+                    # Check owner name loosely matches
+                    if last_name in owner.upper() and location:
+                        print(f'  Found address for {name}: {location}')
+                        return location
+        print(f'  No tax record found for {name} in {city}')
     except Exception as e:
-        print(f'  Address lookup error (name): {e}')
+        print(f'  Address lookup error for {name}: {e}')
     return None
 
 def enrich_address(record):
-    block = record.get('block', '').strip()
-    lot = record.get('lot', '').strip()
-    city = record.get('city', '').strip()
     name = record.get('name', '').strip()
-    if block and lot and block != 'N/A' and lot != 'N/A':
-        result = lookup_address_by_block_lot(block, lot)
-        if result:
-            record['address'] = result['address']
-            record['city'] = result.get('city') or city
-            record['zip'] = result['zip']
-            return record
-    if name and city:
-        last_name = name.split()[-1] if name.split() else name
-        result = lookup_address_by_name(last_name, city)
-        if result:
-            record['address'] = result['address']
-            record['city'] = result.get('city') or city
-            record['zip'] = result['zip']
+    city = record.get('city', '').strip()
+    if not name or not city:
+        return record
+    address = lookup_address(name, city)
+    if address:
+        record['address'] = address
     return record
 
 def reset_to_search(page, url):
@@ -145,6 +171,7 @@ def get_data_rows(page):
                     return data_rows
         except Exception:
             pass
+
     all_tables = page.query_selector_all('table')
     best_table = None
     best_count = 0
@@ -164,9 +191,11 @@ def get_data_rows(page):
         if has_date and len(data_rows) > best_count:
             best_count = len(data_rows)
             best_table = data_rows
+
     if best_table:
         print(f'  Found result table by date-scan: {len(best_table)} rows')
         return best_table
+
     all_rows = page.query_selector_all('table tr')
     rows = [r for r in all_rows if r.query_selector('td')]
     print(f'  Fallback: using all {len(rows)} rows from all tables')
@@ -184,6 +213,7 @@ def parse_row(texts):
         return None
     if date_col < 3 or date_col + 1 >= len(texts):
         return None
+
     recorded_date = texts[date_col].strip()
     direct_party = texts[date_col - 3].strip()
     indirect_party = texts[date_col - 2].strip()
@@ -191,12 +221,14 @@ def parse_row(texts):
     town = texts[date_col + 1].strip() if len(texts) > date_col + 1 else ''
     block = texts[date_col + 2].strip() if len(texts) > date_col + 2 else ''
     lot = texts[date_col + 3].strip() if len(texts) > date_col + 3 else ''
+
     if is_junk_row(direct_party):
         return None
     if not direct_party or len(direct_party) < 2:
         return None
     if re.match(r'^[\d\s]+$', direct_party):
         return None
+
     return {
         'name': direct_party.title(),
         'lender': indirect_party.title(),
@@ -216,12 +248,14 @@ def scrape_essex(page, from_date_str, to_date_str):
     url = 'https://press.essexregister.com/prodpress/clerk/ClerkHome.aspx?op=basic'
     print('Navigating to Essex PRESS...')
     reset_to_search(page, url)
+
     doc_types = [
         ('23', 'LIS PENDENS FORECLOSURE'),
         ('21', 'LIS PENDENS IN REM'),
         ('24', 'LIS PENDENS RECOVERY'),
         ('25', 'LIS PENDENS FORECLOSURE AND RECOVERY'),
     ]
+
     for doc_val, doc_label in doc_types:
         print(f'\n  Searching: {doc_label}...')
         try:
@@ -235,6 +269,7 @@ def scrape_essex(page, from_date_str, to_date_str):
             print(f'  Search error for {doc_label}: {e}')
             reset_to_search(page, url)
             continue
+
         body = page.inner_text('body').lower()
         no_results = any(kw in body for kw in [
             'no records', 'returned 0', 'no results found', '0 records'
@@ -243,6 +278,7 @@ def scrape_essex(page, from_date_str, to_date_str):
             print(f'  {doc_label}: 0 results')
             reset_to_search(page, url)
             continue
+
         page_num = 1
         consecutive_empty = 0
         while True:
@@ -262,6 +298,7 @@ def scrape_essex(page, from_date_str, to_date_str):
                         page_records += 1
                 except Exception as e:
                     print(f'  Row parse error: {e}')
+
             print(f'  Page {page_num}: captured {page_records} records')
             if page_records == 0:
                 consecutive_empty += 1
@@ -269,9 +306,10 @@ def scrape_essex(page, from_date_str, to_date_str):
                     break
             else:
                 consecutive_empty = 0
+
             next_link = None
-            for sel in ['a:has-text("Next")', 'a:has-text(">>")', 'a:has-text(">")',
-                        'input[value="Next"]', 'input[value=">"]']:
+            for sel in ['a:has-text("Next")', 'a:has-text(">>")',
+                        'a:has-text(">")', 'input[value="Next"]', 'input[value=">"]']:
                 try:
                     el = page.query_selector(sel)
                     if el and el.is_visible():
@@ -279,6 +317,7 @@ def scrape_essex(page, from_date_str, to_date_str):
                         break
                 except Exception:
                     pass
+
             if next_link:
                 try:
                     next_link.click()
@@ -290,6 +329,7 @@ def scrape_essex(page, from_date_str, to_date_str):
             else:
                 print(f'  No more pages for {doc_label}')
                 break
+
         reset_to_search(page, url)
     return records
 
@@ -320,26 +360,31 @@ def upload_to_sheets(records, sheet_id):
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(sheet_id)
         ws = sh.sheet1
+
         existing_data = ws.get_all_values()
         if existing_data:
             header = existing_data[0]
             try:
                 inst_col = header.index('instrument_number')
-                existing_instruments = {row[inst_col] for row in existing_data[1:] if len(row) > inst_col}
+                existing_instruments = {row[inst_col] for row in existing_data[1:]
+                                        if len(row) > inst_col}
             except ValueError:
                 existing_instruments = set()
         else:
             existing_instruments = set()
+
         fieldnames = ['name', 'address', 'city', 'state', 'zip', 'county',
                       'filing_date', 'lender', 'instrument_number', 'doc_type', 'block', 'lot']
         if not existing_data:
             ws.append_row(fieldnames)
+
         new_rows = []
         for rec in records:
             inst = rec.get('instrument_number', '')
             if inst not in existing_instruments:
                 new_rows.append([rec.get(f, '') for f in fieldnames])
                 existing_instruments.add(inst)
+
         if new_rows:
             ws.append_rows(new_rows, value_input_option='RAW')
             print(f'Uploaded {len(new_rows)} new records to Google Sheets.')
@@ -354,11 +399,13 @@ def main():
     print(f'Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}')
     print(f'Lookback: {LOOKBACK_DAYS} day(s)')
     print('=' * 45)
+
     today = datetime.now()
     from_date = today - timedelta(days=LOOKBACK_DAYS)
     from_str = from_date.strftime('%m/%d/%Y')
     to_str = today.strftime('%m/%d/%Y')
     print(f'Date range: {from_str} to {to_str}\n')
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=True,
@@ -372,6 +419,7 @@ def main():
         page = ctx.new_page()
         records = scrape_essex(page, from_str, to_str)
         browser.close()
+
     print(f'\nScraped {len(records)} raw records')
     seen = set()
     unique = []
@@ -381,11 +429,14 @@ def main():
             seen.add(key)
             unique.append(r)
     print(f'Unique records: {len(unique)}')
-    print('\nLooking up addresses via NJ MOD-IV tax data...')
+
+    print('\nLooking up addresses via NJ Tax Board records...')
     for rec in unique:
         enrich_address(rec)
-        time.sleep(0.3)
+        time.sleep(1)  # be polite to the tax board server
+
     write_csv(unique, OUTPUT_CSV)
+
     print('\nUploading to Google Sheets...')
     upload_to_sheets(unique, SHEET_ID)
     print('\nDone!')
